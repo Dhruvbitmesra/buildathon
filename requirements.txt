@@ -1,0 +1,27 @@
+# LLM
+langchain-groq
+groq
+
+# LangGraph
+langgraph
+langgraph-checkpoint-sqlite
+
+# Embeddings and reranking
+sentence-transformers
+torch
+transformers
+
+# Vector database
+chromadb
+
+# Retrieval
+rank-bm25
+
+# Web application
+streamlit
+
+# Environment variables
+python-dotenv
+
+# Observability
+langsmith

@@ -1,0 +1,574 @@
+import re
+import numpy as np
+import pandas as pd
+
+from scipy.special import softmax
+from rapidfuzz import fuzz
+
+
+# ============================================================
+# 1. COLUMN PROFILING
+# ============================================================
+
+def profile_column(series: pd.Series) -> dict:
+    """
+    Generate a statistical fingerprint for one SOV column.
+    """
+
+    s = series.dropna()
+    n = len(series)
+
+    if n == 0:
+        return {
+            "dtype": "empty",
+            "total_count": 0,
+            "missing_ratio": 1.0,
+            "unique_ratio": 0.0,
+        }
+
+    # Convert to string for pattern analysis
+    str_s = s.astype(str).str.strip()
+
+    numeric = pd.to_numeric(s, errors="coerce")
+    numeric_mask = numeric.notna()
+
+    numeric_ratio = numeric_mask.mean()
+
+    # Basic statistics
+    profile = {
+        "dtype": str(series.dtype),
+
+        "total_count": n,
+
+        "missing_ratio": float(series.isna().mean()),
+
+        "unique_count": int(s.nunique()),
+
+        "unique_ratio": float(s.nunique() / len(s)),
+
+        "numeric_ratio": float(numeric_ratio),
+
+        "string_ratio": float(1 - numeric_ratio),
+
+        "zero_ratio": float((numeric == 0).mean())
+        if numeric_ratio > 0 else 0.0,
+
+        "negative_ratio": float((numeric < 0).mean())
+        if numeric_ratio > 0 else 0.0,
+
+        "mean": float(numeric.mean())
+        if numeric_mask.any() else None,
+
+        "median": float(numeric.median())
+        if numeric_mask.any() else None,
+
+        "std": float(numeric.std())
+        if numeric_mask.sum() > 1 else None,
+
+        "min": float(numeric.min())
+        if numeric_mask.any() else None,
+
+        "max": float(numeric.max())
+        if numeric_mask.any() else None,
+
+        "q1": float(numeric.quantile(0.25))
+        if numeric_mask.any() else None,
+
+        "q3": float(numeric.quantile(0.75))
+        if numeric_mask.any() else None,
+
+        "skewness": float(numeric.skew())
+        if numeric_mask.sum() > 2 else None,
+
+        "avg_string_length": float(str_s.str.len().mean()),
+
+        "max_string_length": int(str_s.str.len().max()),
+
+        "distinct_values": str_s.nunique(),
+
+        "top_values": (
+            str_s.value_counts()
+            .head(10)
+            .to_dict()
+        )
+    }
+
+    # --------------------------------------------------------
+    # Pattern detection
+    # --------------------------------------------------------
+
+    profile["patterns"] = {
+        "zip_5_digit": float(
+            str_s.str.fullmatch(r"\d{5}").mean()
+        ),
+
+        "year_4_digit": float(
+            str_s.str.fullmatch(r"\d{4}").mean()
+        ),
+
+        "state_code": float(
+            str_s.str.fullmatch(
+                r"[A-Za-z]{2}"
+            ).mean()
+        ),
+
+        "yes_no": float(
+            str_s.str.lower().isin(
+                ["yes", "no", "y", "n"]
+            ).mean()
+        ),
+
+        "currency": float(
+            str_s.str.contains(
+                r"[$€£]|^\d+(\.\d+)?[KMB]$",
+                case=False,
+                regex=True
+            ).mean()
+        ),
+
+        "decimal": float(
+            str_s.str.fullmatch(
+                r"\d+\.\d+"
+            ).mean()
+        )
+    }
+
+    return profile
+
+
+def profile_dataframe(df: pd.DataFrame) -> dict:
+    """
+    Generate profiles for all columns.
+    """
+
+    profiles = {}
+
+    for column in df.columns:
+        profiles[column] = profile_column(df[column])
+
+    return profiles
+
+
+# ============================================================
+# 2. TARGET FIELD EXPECTATIONS
+# ============================================================
+#
+# IMPORTANT:
+# These are examples based on the fields explicitly mentioned
+# in the project material.
+#
+# Replace/add the remaining official Section 09 fields when
+# you receive the complete schema.
+# ============================================================
+
+FIELD_PROFILES = {
+
+    "Building Value": {
+        "expected_numeric": True,
+        "min": 0,
+        "max": 100_000_000,
+        "patterns": ["currency"],
+    },
+
+    "Year Built": {
+        "expected_numeric": True,
+        "min": 1800,
+        "max": 2030,
+        "patterns": ["year_4_digit"],
+    },
+
+    "Storeys": {
+        "expected_numeric": True,
+        "min": 1,
+        "max": 200,
+        "patterns": [],
+    },
+
+    "Zip": {
+        "expected_numeric": False,
+        "patterns": ["zip_5_digit"],
+    },
+
+    "State": {
+        "expected_numeric": False,
+        "patterns": ["state_code"],
+    },
+
+    "Fire Sprinklers": {
+        "expected_numeric": False,
+        "patterns": ["yes_no"],
+    }
+}
+
+
+# ============================================================
+# 3. HEADER EVIDENCE
+# ============================================================
+
+def header_similarity(source_column, target_field):
+    """
+    RapidFuzz similarity between source header and target field.
+    """
+
+    source = re.sub(
+        r"[^a-z0-9]",
+        "",
+        source_column.lower()
+    )
+
+    target = re.sub(
+        r"[^a-z0-9]",
+        "",
+        target_field.lower()
+    )
+
+    return fuzz.ratio(source, target) / 100
+
+
+# ============================================================
+# 4. STATISTICAL EVIDENCE
+# ============================================================
+
+def statistical_evidence(profile, field_profile):
+    """
+    Calculate how compatible the observed column statistics are
+    with the expected target field.
+    """
+
+    evidence = 0.0
+    count = 0
+
+    # --------------------------------------------------------
+    # Numeric / non-numeric compatibility
+    # --------------------------------------------------------
+
+    numeric_ratio = profile["numeric_ratio"]
+
+    if field_profile.get("expected_numeric") is True:
+
+        evidence += numeric_ratio
+        count += 1
+
+    elif field_profile.get("expected_numeric") is False:
+
+        evidence += 1 - numeric_ratio
+        count += 1
+
+    # --------------------------------------------------------
+    # Range compatibility
+    # --------------------------------------------------------
+
+    if (
+        field_profile.get("min") is not None
+        and field_profile.get("max") is not None
+        and profile["min"] is not None
+        and profile["max"] is not None
+    ):
+
+        observed_min = profile["min"]
+        observed_max = profile["max"]
+
+        expected_min = field_profile["min"]
+        expected_max = field_profile["max"]
+
+        min_score = (
+            1
+            if observed_min >= expected_min
+            else 0
+        )
+
+        max_score = (
+            1
+            if observed_max <= expected_max
+            else 0
+        )
+
+        range_score = (min_score + max_score) / 2
+
+        evidence += range_score
+        count += 1
+
+    # --------------------------------------------------------
+    # Pattern compatibility
+    # --------------------------------------------------------
+
+    patterns = field_profile.get("patterns", [])
+
+    if patterns:
+
+        pattern_scores = []
+
+        for pattern in patterns:
+
+            score = profile["patterns"].get(
+                pattern,
+                0
+            )
+
+            pattern_scores.append(score)
+
+        pattern_score = max(pattern_scores)
+
+        evidence += pattern_score
+        count += 1
+
+    if count == 0:
+        return 0.0
+
+    return evidence / count
+
+
+# ============================================================
+# 5. VALUE EVIDENCE
+# ============================================================
+
+def value_evidence(profile, target_field):
+
+    patterns = profile["patterns"]
+
+    if target_field == "Year Built":
+        return patterns["year_4_digit"]
+
+    if target_field == "Zip":
+        return patterns["zip_5_digit"]
+
+    if target_field == "State":
+        return patterns["state_code"]
+
+    if target_field == "Fire Sprinklers":
+        return patterns["yes_no"]
+
+    if target_field == "Building Value":
+
+        if profile["numeric_ratio"] > 0.8:
+
+            if profile["min"] is not None and profile["min"] >= 0:
+                return 1.0
+
+        return 0.0
+
+    if target_field == "Storeys":
+
+        if profile["numeric_ratio"] > 0.8:
+
+            if (
+                profile["min"] is not None
+                and profile["min"] >= 1
+            ):
+                return 1.0
+
+        return 0.0
+
+    return 0.0
+
+
+# ============================================================
+# 6. BAYESIAN-STYLE EVIDENCE MODEL
+# ============================================================
+
+def calculate_bayesian_scores(
+    source_column,
+    profile,
+    target_fields
+):
+
+    scores = {}
+
+    for field in target_fields:
+
+        # ----------------------------------------------------
+        # Evidence 1: Header
+        # ----------------------------------------------------
+
+        header_score = header_similarity(
+            source_column,
+            field
+        )
+
+        # ----------------------------------------------------
+        # Evidence 2: Statistical profile
+        # ----------------------------------------------------
+
+        stat_score = statistical_evidence(
+            profile,
+            FIELD_PROFILES.get(
+                field,
+                {}
+            )
+        )
+
+        # ----------------------------------------------------
+        # Evidence 3: Value patterns
+        # ----------------------------------------------------
+
+        value_score = value_evidence(
+            profile,
+            field
+        )
+
+        # ----------------------------------------------------
+        # Weighted log-evidence style score
+        # ----------------------------------------------------
+        #
+        # Header gets high weight because the column name
+        # usually contains direct semantic information.
+        #
+        # Statistics/value patterns protect us from misleading
+        # or abbreviated headers.
+        # ----------------------------------------------------
+
+        score = (
+            0.40 * header_score
+            + 0.30 * stat_score
+            + 0.30 * value_score
+        )
+
+        scores[field] = score
+
+    return scores
+
+
+# ============================================================
+# 7. CONVERT SCORES INTO PROBABILITIES
+# ============================================================
+
+def scores_to_probability(scores):
+
+    fields = list(scores.keys())
+
+    raw_scores = np.array(
+        [scores[f] for f in fields]
+    )
+
+    probabilities = softmax(
+        raw_scores * 5
+    )
+
+    return {
+        field: float(prob)
+        for field, prob
+        in zip(fields, probabilities)
+    }
+
+
+# ============================================================
+# 8. FINAL COLUMN MAPPING
+# ============================================================
+
+def bayesian_column_mapping(
+    source_column,
+    profile,
+    target_fields
+):
+
+    scores = calculate_bayesian_scores(
+        source_column,
+        profile,
+        target_fields
+    )
+
+    probabilities = scores_to_probability(
+        scores
+    )
+
+    ranked = sorted(
+        probabilities.items(),
+        key=lambda x: x[1],
+        reverse=True
+    )
+
+    best_field, best_probability = ranked[0]
+
+    second_probability = (
+        ranked[1][1]
+        if len(ranked) > 1
+        else 0
+    )
+
+    # --------------------------------------------------------
+    # Confidence / ambiguity
+    # --------------------------------------------------------
+
+    margin = (
+        best_probability
+        - second_probability
+    )
+
+    # Project specification:
+    # below 0.50 -> human review
+    if best_probability < 0.50:
+
+        decision = "human_review_required"
+
+    elif margin < 0.10:
+
+        decision = "ambiguous"
+
+    else:
+
+        decision = "auto_map"
+
+    return {
+        "source_column": source_column,
+
+        "predicted_field": best_field,
+
+        "probability": round(
+            best_probability,
+            4
+        ),
+
+        "second_best": ranked[1][0]
+        if len(ranked) > 1
+        else None,
+
+        "second_probability": round(
+            second_probability,
+            4
+        ),
+
+        "margin": round(
+            margin,
+            4
+        ),
+
+        "decision": decision,
+
+        "ranked_candidates": [
+            {
+                "field": field,
+                "probability": round(
+                    probability,
+                    4
+                )
+            }
+            for field, probability
+            in ranked
+        ]
+    }
+
+
+# ============================================================
+# 9. RUN ON COMPLETE DATAFRAME
+# ============================================================
+
+def analyze_sov(
+    df,
+    target_fields
+):
+
+    profiles = profile_dataframe(df)
+
+    results = []
+
+    for column, profile in profiles.items():
+
+        result = bayesian_column_mapping(
+            column,
+            profile,
+            target_fields
+        )
+
+        results.append(result)
+
+    return pd.DataFrame(results), profiles
