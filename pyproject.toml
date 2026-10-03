@@ -5,12 +5,16 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    "groq>=1.7.0",
     "numpy>=2.5.3",
     "openpyxl>=3.1.5",
     "pandas>=3.0.6",
     "pydantic>=2.13.5",
     "pydantic-settings>=2.15.0",
     "python-dotenv>=1.2.4",
+    "rapidfuzz>=3.14.6",
+    "scipy>=1.18.1",
+    "sentence-transformers>=6.1.0",
 ]
 
 [dependency-groups]
