@@ -2,7 +2,7 @@ from app.ingestion.loader import load_sov_file
 from app.agents.sheet_discovery.header_detector import detect_header
 
 
-files = [
+FILES = [
     "data/input/SOV_B4ID.xlsx",
     "data/input/SOV_H6D2.xlsx",
     "data/input/SOV_K4T9.xlsx",
@@ -10,60 +10,52 @@ files = [
 ]
 
 
-for file_path in files:
-    print("\n" + "=" * 80)
-    print(file_path)
-    print("=" * 80)
+def test_header_detection_on_real_sov_workbooks():
+    """
+    Run header detection across all real SOV workbooks.
 
-    state = load_sov_file(file_path)
+    This is primarily a regression/integration test to make sure
+    header detection runs successfully on the real datasets.
+    """
 
-    for sheet_name, df in state.sheet_data.items():
+    for file_path in FILES:
+        state = load_sov_file(file_path)
 
-        result = detect_header(df)
-
-        print(f"\nSheet: {sheet_name}")
-        print(f"Rows: {len(df)} | Columns: {len(df.columns)}")
-
-        print(
-            f"Detected header row: "
-            f"{result['header_row']}"
+        assert state.sheet_data, (
+            f"No sheets were loaded from {file_path}"
         )
 
-        print(
-            f"Score: "
-            f"{result['header_score']}"
-        )
+        for sheet_name, df in state.sheet_data.items():
+            result = detect_header(df)
 
-        print(
-            f"Confidence: "
-            f"{result['header_confidence']}"
-        )
-
-        print(
-            f"Possible multi-row header: "
-            f"{result['possible_multirow_header']}"
-        )
-
-        if result["header_row"] is not None:
-            row = df.iloc[result["header_row"]]
-
-            print("Detected values:")
-
-            print(
-                [
-                    str(value)
-                    for value in row.tolist()
-                    if str(value).strip() != "nan"
-                ]
+            assert isinstance(result, dict), (
+                f"Invalid detector result for "
+                f"{file_path} -> {sheet_name}"
             )
 
-        print("\nTop candidates:")
+            assert "header_row" in result
+            assert "header_score" in result
+            assert "header_confidence" in result
+            assert "candidate_rows" in result
+            assert "possible_multirow_header" in result
+            assert "header_rejected_as_data" in result
 
-        for candidate in result["candidate_rows"][:3]:
-            print(
-                f"  Row {candidate['row']} "
-                f"→ score={candidate['score']} "
-                f"text={candidate['text_ratio']} "
-                f"SOV={candidate['sov_term_ratio']} "
-                f"data_below={candidate['data_below_score']}"
-            )
+
+def test_header_candidates_have_compatible_keys():
+    """
+    Ensure every generated candidate contains both row identifiers.
+
+    'row' is retained for compatibility with existing debugging/tests,
+    while 'row_index' is the canonical internal field.
+    """
+
+    for file_path in FILES:
+        state = load_sov_file(file_path)
+
+        for sheet_name, df in state.sheet_data.items():
+            result = detect_header(df)
+
+            for candidate in result["candidate_rows"]:
+                assert "row" in candidate
+                assert "row_index" in candidate
+                assert candidate["row"] == candidate["row_index"]

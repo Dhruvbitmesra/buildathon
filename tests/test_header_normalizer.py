@@ -33,8 +33,7 @@ def test_normalize_header_punctuation():
 def test_normalize_header_separators():
     result = normalize_header("State-Code/Zip_Code")
 
-    assert result == "state code zip_code"
-
+    assert result == "state code zip code"
 
 def test_abbreviations_are_preserved():
     result = normalize_header(
