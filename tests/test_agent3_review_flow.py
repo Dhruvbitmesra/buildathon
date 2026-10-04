@@ -516,15 +516,48 @@ def test_groq_reasoner_falls_back_on_bad_output():
     assert second.reasoning_source == ReasoningSource.DETERMINISTIC
 
 
+class BatchExplainClient(FakeGroqClient):
+    """Answers a batched explain request for every item it receives."""
+
+    def create(self, **kwargs):
+        import json as _json
+
+        self.calls.append(kwargs)
+        items = _json.loads(kwargs["messages"][1]["content"])["items"]
+        self.content = _json.dumps(
+            {"explanations": {i["id"]: f"Impact of {i['rule_id']}." for i in items}}
+        )
+        return self._response()
+
+    def _response(self):
+        content = self.content
+
+        class Message:
+            pass
+
+        Message.content = content
+
+        class Choice:
+            message = Message()
+
+        class Response:
+            choices = [Choice()]
+
+        return Response()
+
+
 def test_llm_explanations_are_optional_and_do_not_change_values():
-    client = FakeGroqClient('{"explanation": "Negative values understate exposure."}')
+    client = BatchExplainClient("")
     agent = DataQualityAgent(reasoner=GroqReasoner(client=client), explain_with_llm=True)
     result = agent.analyse(frame(), current_year=YEAR)
 
     rec = rec_where(result, issue_type=IssueType.NEGATIVE_VALUE)
 
-    assert rec.llm_explanation == "Negative values understate exposure."
+    assert len(client.calls) == 1  # one batched call
+    assert rec.llm_explanation == "Impact of non_negative_value."
     assert rec.operation == Operation.KEEP
+    payload = client.calls[0]["messages"][1]["content"]
+    assert "1 Main St" not in payload  # identifying values masked
 
 
 def test_rule_based_reasoner_is_default_fallback():

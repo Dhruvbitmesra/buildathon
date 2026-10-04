@@ -49,6 +49,31 @@ class PipelineResult:
     errors: list[str] = field(default_factory=list)
 
 
+def readable_read_error(error: Exception) -> str:
+    """Translate library errors into a message a reviewer can act on."""
+
+    text = str(error)
+    lowered = text.lower()
+
+    if "format cannot be determined" in lowered or "not a zip file" in lowered or "bad zip" in lowered:
+        return (
+            "The file is not a valid Excel workbook. It may be corrupt, "
+            "password-protected or saved in another format; re-save it as "
+            ".xlsx and upload again."
+        )
+
+    if "no columns to parse" in lowered:
+        return "The CSV file is empty."
+
+    if "xlrd" in lowered:
+        return "Reading .xls files needs the 'xlrd' package; save the file as .xlsx."
+
+    if "codec" in lowered or "decode" in lowered:
+        return "The CSV file's text encoding could not be read; save it as UTF-8."
+
+    return f"The file could not be read: {text}"
+
+
 def llm_available() -> bool:
     from dotenv import load_dotenv
 
@@ -103,9 +128,11 @@ def build_agents(
         mapping_client = GroqLLMClient()
         reasoner = GroqReasoner()
 
+    # With the LLM on, Agent 3 also adds batched business-impact notes
+    # (FR-4: LLM-powered reasoning); values are always deterministic.
     return SchemaMappingAgent(
         llm_client=mapping_client, memory=memory
-    ), DataQualityAgent(reasoner=reasoner)
+    ), DataQualityAgent(reasoner=reasoner, explain_with_llm=use_llm)
 
 
 class PipelineRun:
@@ -159,9 +186,7 @@ class PipelineRun:
         except FileValidationError as error:
             return self._fail("ingestion", str(error))
         except Exception as error:
-            return self._fail(
-                "ingestion", f"The file could not be read: {error}"
-            )
+            return self._fail("ingestion", readable_read_error(error))
 
         self.timings["ingestion"] = time.perf_counter() - started
         state.metadata["llm_enabled"] = self.use_llm
@@ -291,6 +316,7 @@ class PipelineRun:
                 changes=self.session.approved_changes(),
                 ledger=self.session.ledger,
                 output_dir=self.output_dir,
+                context=self.summary_context(),
             )
         except (ExportBlockedError, ReviewError, ValueError) as error:
             self._fail("transformation", f"Agent 4 failed: {error}")
@@ -302,6 +328,8 @@ class PipelineRun:
         self.stage_reached = "transformation"
         self.artifacts["cleaned_sov"] = result.output_path
         self.artifacts["audit_log"] = result.audit_json_path
+        self.artifacts["audit_log_xlsx"] = result.audit_xlsx_path
+        self.artifacts["processing_summary"] = result.summary_path
         self.state.agent_trace.append(
             {
                 "agent": "transformation",
@@ -317,6 +345,30 @@ class PipelineRun:
             f"Schema problem: {problem}" for problem in result.schema_problems
         )
         return result
+
+    def summary_context(self) -> dict[str, Any]:
+        state = self.state
+        mapping = state.metadata.get("schema_mapping_json", {})
+        report = state.quality_report
+
+        return {
+            "source_file": Path(self.file_path).name,
+            "selected_sheet": state.selected_sheet,
+            "header_row": state.header_row + 1 if state.header_row is not None else None,
+            "llm_enabled": self.use_llm,
+            "mapping": {
+                "mapped": sum(1 for m in mapping.get("mappings", {}).values() if m["target"]),
+                "unresolved": mapping.get("unresolved_count"),
+                "overall_confidence": mapping.get("overall_confidence"),
+            },
+            "quality": {
+                "intake_quality_score": report.intake_quality_score,
+                "total_issues": report.total_issues,
+                "issues_by_severity": report.issues_by_severity,
+            },
+            "excluded_rows": len(state.metadata.get("excluded_rows", [])),
+            "timings": dict(self.timings),
+        }
 
     def remember_mappings(self) -> int:
         """
@@ -543,6 +595,7 @@ def _review_queue(state: SOVState) -> list[dict[str, Any]]:
                 "title": rec.title,
                 "rationale": rec.rationale,
                 "uncertainty": rec.uncertainty,
+                "llm_explanation": rec.llm_explanation,
                 "fix_confidence": rec.fix_confidence,
                 "source_column": rec.source_column,
                 "target_field": rec.target_field,

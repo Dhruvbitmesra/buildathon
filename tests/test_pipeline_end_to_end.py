@@ -504,3 +504,107 @@ def test_export_stores_reviewed_mappings_in_memory(tmp_path, monkeypatch):
     assert stored.recall("Bldg Repl Cost New")["target"] == "Building Value"
     # Only headers are stored, never row values.
     assert "450000" not in memory_path.read_text()
+
+
+# ---------------------------------------------------------------------
+# Problem-statement compliance (FR-6, NFR-3, C-07, Agent 4 outputs)
+# ---------------------------------------------------------------------
+
+
+def test_cleaned_workbook_is_single_sheet_and_audit_is_separate(tmp_path):
+    state, session = _reviewed(approve_all=True)
+
+    result = TransformationAgent().export(
+        state.data_table, state.schema_mappings, session.approved_changes(),
+        session.ledger, tmp_path,
+    )
+
+    assert load_workbook(result.output_path).sheetnames == ["Cleaned_SOV"]
+    assert Path(result.audit_xlsx_path).name == "Audit_Log.xlsx"
+    assert load_workbook(result.audit_xlsx_path).sheetnames == ["Audit_Log"]
+    assert Path(result.summary_path).name == "Processing_Summary.md"
+    assert (tmp_path / "Processing_Summary.json").exists()
+
+
+def test_every_changed_cell_is_in_the_audit_log(tmp_path):
+    state, session = _reviewed(approve_all=True)
+
+    result = TransformationAgent().export(
+        state.data_table, state.schema_mappings, session.approved_changes(),
+        session.ledger, tmp_path,
+    )
+
+    audit = json.loads(Path(result.audit_json_path).read_text())
+    logged = {(e["target_column"], e["source_row"]) for e in audit if e["source_row"]}
+    sheet = load_workbook(result.output_path)["Cleaned_SOV"]
+    header = [c.value for c in sheet[1]]
+    excel_rows = list(state.data_table.index)
+
+    for position, row in enumerate(sheet.iter_rows(min_row=2, values_only=True)):
+        for field, value in zip(header, row):
+            source = {
+                "Reference": "Loc", "Zip": "Zip", "Building Value": "TIV",
+                "Fire Sprinklers (Y/N)": "Sprk", "Year Built": "Yr",
+            }.get(field)
+
+            if source is None:
+                continue
+
+            before = state.data_table.iloc[position][source]
+
+            if before is None or (isinstance(before, float) and pd.isna(before)):
+                continue
+
+            if type(before) is not type(value) or before != value:
+                assert (field, excel_rows[position]) in logged, (field, before, value)
+
+
+def test_validate_output_rejects_extra_sheets(tmp_path):
+    from openpyxl import Workbook
+
+    from app.agents.data_quality.config import SOV_REQUIRED_FIELDS
+
+    workbook = Workbook()
+    workbook.active.title = "Cleaned_SOV"
+    workbook.active.append(list(SOV_REQUIRED_FIELDS))
+    workbook.create_sheet("Audit_Log")
+    path = tmp_path / "two.xlsx"
+    workbook.save(path)
+
+    assert any("single sheet" in problem for problem in validate_output(path))
+
+
+def test_validate_output_detects_merged_cells(tmp_path):
+    from openpyxl import Workbook
+
+    from app.agents.data_quality.config import SOV_REQUIRED_FIELDS
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Cleaned_SOV"
+    sheet.append(list(SOV_REQUIRED_FIELDS))
+    sheet.append(["A"] * 3)
+    sheet.merge_cells("A2:B2")
+    path = tmp_path / "merged.xlsx"
+    workbook.save(path)
+
+    assert "sheet contains merged cells" in validate_output(path)
+
+
+def test_readable_errors_for_bad_files(tmp_path):
+    corrupt = tmp_path / "corrupt.xlsx"
+    corrupt.write_bytes(b"not a workbook")
+    empty = tmp_path / "empty.csv"
+    empty.write_text("")
+
+    assert "not a valid Excel workbook" in run_pipeline(str(corrupt), output_dir=tmp_path, use_llm=False).errors[0]
+    assert run_pipeline(str(empty), output_dir=tmp_path, use_llm=False).errors[0] == "The CSV file is empty."
+
+
+def test_llm_samples_are_masked():
+    from app.agents.schema_mapping.llm_prompt import mask_sample
+
+    assert mask_sample("505 Gentry Memorial Hwy") == "999 Aaaaaa Aaaaaaaa Aaa"
+    assert mask_sample("Sonae Client A Portugal SA") == "Aaaaa Aaaaaa A Aaaaaaaa AA"
+    assert mask_sample("TX") == "TX"
+    assert mask_sample("Masonry") == "Masonry"

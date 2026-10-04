@@ -19,6 +19,12 @@ from app.pipeline import run_pipeline
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Windows consoles (cp1252) cannot print every character found in
+    # client data or LLM text; never crash on output.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(description="SOVereign AI pipeline")
     parser.add_argument("file", help="SOV file (.xlsx, .xls or .csv)")
     parser.add_argument(

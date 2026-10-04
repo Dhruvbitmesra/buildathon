@@ -28,8 +28,8 @@ applied in order (a reject followed by an approve approves the re-reasoned attem
 
 Outputs per file: `sheet_manifest.json`, `schema_mapping.json` (problem
 statement section 09 format), `quality_report.json`, `review_queue.json`,
-and once every item is decided `Cleaned_SOV.xlsx` (sheets `Cleaned_SOV`
-and `Audit_Log`), `Audit_Log.json`, `agent_trace.json`.
+and once every item is decided `Cleaned_SOV.xlsx` (single sheet `Cleaned_SOV`; see Step 7
+for the separate audit files), `Audit_Log.json`, `agent_trace.json`.
 
 ## Errors found and fixed
 

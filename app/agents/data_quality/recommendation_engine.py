@@ -114,6 +114,9 @@ class CandidateChecker:
         self.validator = DeterministicValidator()
         self.config = get_sov_validation_config()
         self.current_year = current_year
+        # Large files repeat the same candidate values thousands of
+        # times; validating each distinct value once is enough.
+        self._cache: dict[tuple, list[str]] = {}
 
     def problems(
         self,
@@ -128,6 +131,26 @@ class CandidateChecker:
         if value is None:
             return []
 
+        key = (
+            field_name,
+            type(value).__name__,
+            repr(value),
+            normalizers.is_us_country(country),
+        )
+
+        if key in self._cache:
+            return list(self._cache[key])
+
+        result = self._problems(field_name, value, country)
+        self._cache[key] = result
+        return list(result)
+
+    def _problems(
+        self,
+        field_name: str,
+        value: Any,
+        country: Any,
+    ) -> list[str]:
         data: dict[str, list[Any]] = {field_name: [value]}
 
         if field_name != "Country" and not normalizers.is_missing(country):

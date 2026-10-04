@@ -17,6 +17,7 @@ falls back to RuleBasedReasoner.
 import json
 import os
 import re
+import time
 from typing import Any, Optional, Protocol
 
 from pydantic import BaseModel, Field
@@ -199,6 +200,13 @@ fixed. Do not propose new values. Reply with JSON only:
 {"explanation": "..."}"""
 
 
+_EXPLAIN_BATCH_PROMPT = """You explain data-quality findings in insurance
+Statements of Values to non-technical underwriting staff. For each item,
+write at most two sentences on the business impact (pricing, exposure,
+modelling) if it is not fixed. Do not propose new values or operations.
+Reply with JSON only: {"explanations": {"<id>": "...", ...}}"""
+
+
 class GroqReasoner:
     """LLM reasoner using Groq (same provider/model as Agent 2)."""
 
@@ -268,24 +276,70 @@ class GroqReasoner:
 
         return explanation.strip() if isinstance(explanation, str) else None
 
-    def _complete(self, system_prompt: str, payload: dict) -> Optional[str]:
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {
-                        "role": "user",
-                        "content": json.dumps(payload, default=str),
-                    },
-                ],
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
-        except Exception:
-            return None
+    def explain_batch(
+        self,
+        recommendations: list[Recommendation],
+    ) -> dict[str, str]:
+        """
+        Business-impact explanations for several recommendations in one
+        call (masked input). Returns {recommendation_id: explanation}.
+        """
 
-        return response.choices[0].message.content or None
+        if not recommendations:
+            return {}
+
+        payload = {
+            "items": [
+                {"id": rec.recommendation_id, **masked_summary(rec)}
+                for rec in recommendations
+            ]
+        }
+        content = self._complete(_EXPLAIN_BATCH_PROMPT, payload)
+
+        if content is None:
+            return {}
+
+        try:
+            explanations = json.loads(content).get("explanations", {})
+        except (ValueError, AttributeError):
+            return {}
+
+        known = {rec.recommendation_id for rec in recommendations}
+
+        return {
+            str(rec_id): text.strip()
+            for rec_id, text in (explanations or {}).items()
+            if str(rec_id) in known and isinstance(text, str) and text.strip()
+        }
+
+    def _complete(self, system_prompt: str, payload: dict) -> Optional[str]:
+        from app.agents.schema_mapping.groq_client import (
+            _is_rate_limit,
+            _retry_delay,
+        )
+
+        for attempt in range(1, 4):
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {
+                            "role": "user",
+                            "content": json.dumps(payload, default=str),
+                        },
+                    ],
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+                return response.choices[0].message.content or None
+            except Exception as error:
+                if attempt == 3 or not _is_rate_limit(error):
+                    return None
+
+                time.sleep(_retry_delay(error, attempt, 15.0))
+
+        return None
 
 
 def masked_summary(recommendation: Recommendation) -> dict[str, Any]:

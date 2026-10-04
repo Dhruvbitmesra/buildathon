@@ -69,5 +69,7 @@ def test_streamlit_review_flow(tmp_path):
     assert run.export_result is not None and run.export_result.schema_valid
     assert {b.label for b in app.get("download_button")} == {
         "Download Cleaned_SOV.xlsx",
+        "Download Audit_Log.xlsx",
         "Download Audit_Log.json",
+        "Download processing summary",
     }

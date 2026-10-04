@@ -11,7 +11,7 @@
 | 2 · Mapping | Source -> target, confidence bar, method, flags; mapping JSON |
 | 3 · Data quality | Intake score, issues by type/severity, per-field completeness and validity, per-row flags |
 | 4 · Review | Queue with filters; per item: rationale, uncertainty, confidence, before/after sample, decision history; Approve / Reject (note required) / Edit (typed value, per-row editor, or target field) / Escalate; **Approve All** for lossless items >= 0.90 |
-| 5 · Preview & export | Before/after side by side; export disabled until nothing is pending; downloads for `Cleaned_SOV.xlsx` and `Audit_Log.json`; audit table |
+| 5 · Preview & export | Before/after side by side; export disabled until nothing is pending; downloads for `Cleaned_SOV.xlsx`, `Audit_Log.xlsx`, `Audit_Log.json` and the processing summary; audit table |
 
 The UI and CLI share `PipelineRun` (`app/pipeline.py`): `analyse()`,
 `submit()`, `revalidate_if_needed()`, `preview()`, `export()`.

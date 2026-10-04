@@ -50,7 +50,7 @@ uv run python -m app.main FILE --no-llm --no-memory                # determinist
 
 Outputs go to `output/<file>_<ext>/`: `sheet_manifest.json`,
 `schema_mapping.json`, `quality_report.json`, `review_queue.json`, and
-after export `Cleaned_SOV.xlsx`, `Audit_Log.json`, `agent_trace.json`.
+after export `Cleaned_SOV.xlsx` (single sheet), `Audit_Log.xlsx`, `Audit_Log.json`, `Processing_Summary.md`/`.json`, `agent_trace.json`.
 
 ## Evaluate
 

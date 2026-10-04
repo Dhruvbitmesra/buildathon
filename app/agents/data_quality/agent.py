@@ -97,7 +97,7 @@ class DataQualityAgent:
         reasoner: Reasoner | None = None,
         max_reasoning_attempts: int = 2,
         explain_with_llm: bool = False,
-        max_llm_explanations: int = 15,
+        max_llm_explanations: int = 20,
     ) -> None:
         self.validator = validator or DeterministicValidator()
         self.aggregator = aggregator or QualityAggregator()
@@ -285,21 +285,34 @@ class DataQualityAgent:
         self,
         recommendations: list[Recommendation],
     ) -> list[Recommendation]:
-        explained: list[Recommendation] = []
-        budget = self.max_llm_explanations
+        """
+        Add LLM business-impact notes to the items that need a human
+        decision (highest priority first). One batched call when the
+        reasoner supports it. Notes never change operations or values.
+        """
 
-        for rec in recommendations:
-            if budget > 0 and rec.policy == ReviewPolicy.HUMAN_REVIEW_REQUIRED:
-                budget -= 1
+        targets = [
+            rec
+            for rec in recommendations
+            if rec.policy == ReviewPolicy.HUMAN_REVIEW_REQUIRED
+        ][: self.max_llm_explanations]
 
-                try:
+        notes: dict[str, str] = {}
+
+        try:
+            if hasattr(self.reasoner, "explain_batch"):
+                notes = self.reasoner.explain_batch(targets)
+            else:
+                for rec in targets:
                     note = self.reasoner.explain(rec)
-                except Exception:
-                    note = None
+                    if note:
+                        notes[rec.recommendation_id] = note
+        except Exception:
+            notes = {}
 
-                if note:
-                    rec = rec.model_copy(update={"llm_explanation": note})
-
-            explained.append(rec)
-
-        return explained
+        return [
+            rec.model_copy(update={"llm_explanation": notes[rec.recommendation_id]})
+            if rec.recommendation_id in notes
+            else rec
+            for rec in recommendations
+        ]

@@ -15,7 +15,7 @@ placeholders. Alternative: **SOV_H6D2.xlsx** for a clean US example.
 | 4 | Recommendations | **4 · Review** | Open one *column_mapping*, one *data_correction* (`9999` → blank), one *standardisation* (e.g. trailing spaces / state codes): each shows rationale, uncertainty, confidence and a before → after table. |
 | 5 | Approval workflow | **4 · Review** | Click **Approve All** (only lossless ≥ 0.90 items). Approve one item. **Reject** one with a note (e.g. on a sprinkler/placeholder item: "client confirmed these are N") → the agent re-reasons (attempt 2, title "revised after rejection"). Reject again → **Escalated**. Show *Decision history*. Edit a mapping → Agent 3 re-validates. |
 | 6 | Transformation and audit | **5 · Preview & export** | Before/after side by side. Export is blocked until nothing is pending — finish the queue, click **Export**; show the audit log (source/target column, before/after, confidence, approved_by, timestamp). |
-| 7 | Download | **5 · Preview & export** | Download `Cleaned_SOV.xlsx`: one sheet `Cleaned_SOV`, 17 headers in row 1, data from row 2, no merged cells, blanks not zeros; `Audit_Log` sheet and `Audit_Log.json`. |
+| 7 | Download | **5 · Preview & export** | Download `Cleaned_SOV.xlsx`: one sheet `Cleaned_SOV`, 17 headers in row 1, data from row 2, no merged cells, blanks not zeros; separate `Audit_Log.xlsx` / `Audit_Log.json` and the processing summary. |
 
 Close on the **Workflow** tab: the live agent diagram (green done,
 amber waiting for review, dashed re-reasoning loop) — bonus

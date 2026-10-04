@@ -33,6 +33,9 @@ OUTPUT_FILE = "Cleaned_SOV.xlsx"
 OUTPUT_SHEET = "Cleaned_SOV"
 AUDIT_SHEET = "Audit_Log"
 AUDIT_JSON = "Audit_Log.json"
+AUDIT_XLSX = "Audit_Log.xlsx"
+SUMMARY_JSON = "Processing_Summary.json"
+SUMMARY_MD = "Processing_Summary.md"
 
 # Data dictionary (problem statement, section 08).
 FIELD_TYPES = {
@@ -82,6 +85,8 @@ class AuditEntry(BaseModel):
 class TransformationResult(BaseModel):
     output_path: str
     audit_json_path: str
+    audit_xlsx_path: str = ""
+    summary_path: str = ""
     rows: int
     applied_changes: int
     audit_entries: int
@@ -222,20 +227,22 @@ class TransformationAgent:
             )
             output[field] = casted
 
-            if converted:
+            # NFR-3: every cell whose stored value changes is logged.
+            for position, before, after in converted:
                 audit.append(
                     AuditEntry(
                         source_column=target_to_source.get(field),
                         target_column=field,
+                        source_row=excel_rows.get(position),
                         transformation_applied=f"cast_to_{FIELD_TYPES[field]}",
-                        before_value=f"{converted} cell(s)",
-                        after_value=FIELD_TYPES[field],
+                        before_value=_plain(before),
+                        after_value=after,
                         confidence=1.0,
                         approved_by="data_dictionary",
                         timestamp=now,
                         rationale=(
-                            "Lossless representation cast required by the "
-                            "target data dictionary (e.g. 1970.0 -> 1970)."
+                            "Lossless type cast required by the target data "
+                            f"dictionary ({field} is {FIELD_TYPES[field]})."
                         ),
                     )
                 )
@@ -271,6 +278,7 @@ class TransformationAgent:
         changes: list[ApprovedChange],
         ledger: Any,
         output_dir: str | Path,
+        context: Optional[dict[str, Any]] = None,
     ) -> TransformationResult:
         output, audit, applied = self.transform(
             data_table, mappings, changes, ledger
@@ -280,34 +288,45 @@ class TransformationAgent:
         output_dir.mkdir(parents=True, exist_ok=True)
         workbook_path = output_dir / OUTPUT_FILE
         audit_path = output_dir / AUDIT_JSON
+        audit_xlsx_path = output_dir / AUDIT_XLSX
 
-        _write_workbook(output, audit, workbook_path)
+        # FR-6: Cleaned_SOV.xlsx is single-sheet; the audit log is a
+        # separate Audit_Log.xlsx / Audit_Log.json (C-07).
+        _write_workbook(output, workbook_path)
+
+        # Serialise the audit once; reuse for the workbook and the JSON.
+        records = [entry.model_dump() for entry in audit]
+        _write_audit_workbook(records, audit_xlsx_path)
 
         audit_path.write_text(
-            json.dumps(
-                [entry.model_dump() for entry in audit],
-                indent=2,
-                default=str,
-            ),
+            json.dumps(records, indent=1, default=str),
             encoding="utf-8",
         )
 
         problems = validate_output(workbook_path)
+        blanked = sum(
+            1
+            for entry in audit
+            if entry.transformation_applied == "uncastable_value_left_blank"
+        )
 
-        return TransformationResult(
+        result = TransformationResult(
             output_path=str(workbook_path),
             audit_json_path=str(audit_path),
+            audit_xlsx_path=str(audit_xlsx_path),
             rows=int(len(output)),
             applied_changes=applied,
             audit_entries=len(audit),
-            blanked_uncastable_cells=sum(
-                1
-                for entry in audit
-                if entry.transformation_applied == "uncastable_value_left_blank"
-            ),
+            blanked_uncastable_cells=blanked,
             schema_valid=not problems,
             schema_problems=problems,
         )
+
+        summary_path = write_processing_summary(
+            output_dir, result, audit, ledger, context or {}
+        )
+
+        return result.model_copy(update={"summary_path": str(summary_path)})
 
 
 def _plain(value: Any) -> Any:
@@ -330,12 +349,15 @@ def _cast_column(
     series: pd.Series,
     field_type: str,
     allowed: set[str] | None = None,
-) -> tuple[list[Any], list[tuple[int, Any]], int]:
-    """Return (cast values, uncastable (position, value), converted count)."""
+) -> tuple[list[Any], list[tuple[int, Any]], list[tuple[int, Any, Any]]]:
+    """
+    Return (cast values, uncastable (position, value),
+    converted (position, before, after)).
+    """
 
     values: list[Any] = []
     failures: list[tuple[int, Any]] = []
-    converted = 0
+    converted: list[tuple[int, Any, Any]] = []
 
     for position, value in enumerate(series.tolist()):
         if normalizers.is_missing(value):
@@ -353,7 +375,7 @@ def _cast_column(
             continue
 
         if type(cast) is not type(value) or cast != value:
-            converted += 1
+            converted.append((position, value, cast))
 
         values.append(cast)
 
@@ -392,98 +414,204 @@ def _cast_value(value: Any, field_type: str) -> Any:
     return None
 
 
-def _write_workbook(
-    output: pd.DataFrame,
-    audit: list[AuditEntry],
-    path: Path,
-) -> None:
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = OUTPUT_SHEET
-    sheet.append(list(SOV_REQUIRED_FIELDS))
+def _write_workbook(output: pd.DataFrame, path: Path) -> None:
+    """Single sheet "Cleaned_SOV": headers in row 1, data from row 2."""
 
-    zip_column = SOV_REQUIRED_FIELDS.index("Zip") + 1
+    from openpyxl.cell import WriteOnlyCell
+
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet(OUTPUT_SHEET)
+    sheet.append(list(SOV_REQUIRED_FIELDS))
+    zip_index = SOV_REQUIRED_FIELDS.index("Zip")
 
     for row in output.itertuples(index=False):
-        sheet.append([None if normalizers.is_missing(v) else v for v in row])
+        values = [None if normalizers.is_missing(v) else v for v in row]
+        zip_value = values[zip_index]
 
-    # Zip is stored as an integer (data dictionary) but displayed with
-    # 5 digits so leading zeros stay visible (00802).
-    for (cell,) in sheet.iter_rows(
-        min_row=2, min_col=zip_column, max_col=zip_column
-    ):
-        if isinstance(cell.value, int):
+        # Zip is an integer (data dictionary) displayed with 5 digits so
+        # leading zeros stay visible (00802). No colour formatting.
+        if isinstance(zip_value, int):
+            cell = WriteOnlyCell(sheet, value=zip_value)
             cell.number_format = "00000"
+            values[zip_index] = cell
 
-    audit_sheet = workbook.create_sheet(AUDIT_SHEET)
+        sheet.append(values)
+
+    workbook.save(path)
+
+
+def _write_audit_workbook(records: list[dict], path: Path) -> None:
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet(AUDIT_SHEET)
     columns = list(AuditEntry.model_fields)
-    audit_sheet.append(columns)
+    sheet.append(columns)
+    primitive = (int, float, str)
 
-    for entry in audit:
-        data = entry.model_dump()
-        audit_sheet.append(
+    for record in records:
+        sheet.append(
             [
                 value
-                if value is None or isinstance(value, (int, float, str))
+                if value is None or isinstance(value, primitive)
                 else json.dumps(value, default=str)
-                for value in (data[column] for column in columns)
+                for value in (record[column] for column in columns)
             ]
         )
 
     workbook.save(path)
 
 
-def validate_output(path: str | Path) -> list[str]:
-    """Check the written workbook against the target schema (NFR-5)."""
+def write_processing_summary(
+    output_dir: Path,
+    result: "TransformationResult",
+    audit: list[AuditEntry],
+    ledger: Any,
+    context: dict[str, Any],
+) -> Path:
+    """Agent 4's processing summary report (JSON + readable Markdown)."""
 
-    problems: list[str] = []
-    workbook = load_workbook(path)
+    from collections import Counter
 
-    if OUTPUT_SHEET not in workbook.sheetnames:
-        return [f"sheet '{OUTPUT_SHEET}' is missing"]
-
-    if workbook.sheetnames[0] != OUTPUT_SHEET:
-        problems.append(f"first sheet is '{workbook.sheetnames[0]}'")
-
-    sheet = workbook[OUTPUT_SHEET]
-    header = [cell.value for cell in sheet[1]]
-
-    if header != list(SOV_REQUIRED_FIELDS):
-        problems.append(f"headers are {header}")
-
-    if sheet.merged_cells.ranges:
-        problems.append("sheet contains merged cells")
-
-    expected = {
-        "string": (str,),
-        "float": (float, int),
-        "integer": (int,),
+    transformations = Counter(entry.transformation_applied for entry in audit)
+    review = ledger.summary()
+    summary = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        **context,
+        "review": review,
+        "output": {
+            "file": OUTPUT_FILE,
+            "rows": result.rows,
+            "schema_valid": result.schema_valid,
+            "schema_problems": result.schema_problems,
+        },
+        "transformations": dict(transformations),
+        "approved_changes_applied": result.applied_changes,
+        "uncastable_cells_left_blank": result.blanked_uncastable_cells,
+        "audit_entries": result.audit_entries,
     }
 
-    for column_index, field in enumerate(SOV_REQUIRED_FIELDS, start=1):
-        allowed = expected[FIELD_TYPES[field]]
+    (output_dir / SUMMARY_JSON).write_text(
+        json.dumps(summary, indent=2, default=str), encoding="utf-8"
+    )
 
-        for (cell,) in sheet.iter_rows(
-            min_row=2, min_col=column_index, max_col=column_index
-        ):
-            value = cell.value
+    lines = [
+        "# SOV Processing Summary",
+        "",
+        f"- Generated: {summary['generated_at']}",
+    ]
 
-            if value is None:
-                continue
+    for key in ("source_file", "selected_sheet", "header_row", "llm_enabled"):
+        if key in context:
+            lines.append(f"- {key.replace('_', ' ').title()}: {context[key]}")
 
-            if isinstance(value, bool) or not isinstance(value, allowed):
-                problems.append(
-                    f"{field} row {cell.row}: {value!r} is not "
-                    f"{FIELD_TYPES[field]}"
-                )
-                break
+    if "mapping" in context:
+        mapping = context["mapping"]
+        lines += [
+            "",
+            "## Schema mapping",
+            f"- Mapped columns: {mapping.get('mapped')}",
+            f"- Unresolved columns: {mapping.get('unresolved')}",
+            f"- Overall confidence: {mapping.get('overall_confidence')}",
+        ]
 
-            if field == "Fire Sprinklers (Y/N)" and value not in {
-                "Y", "N", "Y13", "Y(13R)"
-            }:
-                problems.append(
-                    f"{field} row {cell.row}: {value!r} is not an allowed value"
-                )
+    if "quality" in context:
+        quality = context["quality"]
+        lines += [
+            "",
+            "## Data quality at intake",
+            f"- Intake quality score: {quality.get('intake_quality_score')}",
+            f"- Issues: {quality.get('total_issues')}",
+            f"- By severity: {quality.get('issues_by_severity')}",
+        ]
+
+    lines += [
+        "",
+        "## Human review",
+        f"- Recommendations: {review['total']}",
+        f"- Decisions: {review['by_status']}",
+        "",
+        "## Output",
+        f"- {OUTPUT_FILE}: {result.rows} rows, schema valid: {result.schema_valid}",
+        f"- Approved changes applied: {result.applied_changes}",
+        f"- Values not representable in the schema type, left blank: "
+        f"{result.blanked_uncastable_cells}",
+        f"- Audit entries: {result.audit_entries} ({AUDIT_XLSX}, {AUDIT_JSON})",
+        "",
+        "| Transformation | Cells |",
+        "|---|---|",
+    ]
+    lines += [f"| {name} | {count} |" for name, count in transformations.most_common()]
+
+    if "timings" in context:
+        lines += ["", "## Timings (s)"]
+        lines += [f"- {k}: {v:.1f}" for k, v in context["timings"].items()]
+
+    path = output_dir / SUMMARY_MD
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def validate_output(path: str | Path) -> list[str]:
+    """
+    Check the written workbook against the target schema (NFR-5, FR-6):
+    single sheet "Cleaned_SOV", the 17 headers in order, no merged cells,
+    cell types per the data dictionary, allowed sprinkler values.
+    """
+
+    import zipfile
+
+    problems: list[str] = []
+    workbook = load_workbook(path, read_only=True)
+
+    try:
+        if OUTPUT_SHEET not in workbook.sheetnames:
+            return [f"sheet '{OUTPUT_SHEET}' is missing"]
+
+        if workbook.sheetnames != [OUTPUT_SHEET]:
+            problems.append(
+                f"workbook must have a single sheet; found {workbook.sheetnames}"
+            )
+
+        sheet = workbook[OUTPUT_SHEET]
+        rows = sheet.iter_rows(values_only=True)
+        header = list(next(rows, []))
+
+        if header != list(SOV_REQUIRED_FIELDS):
+            problems.append(f"headers are {header}")
+            return problems
+
+        expected = {
+            "string": (str,),
+            "float": (float, int),
+            "integer": (int,),
+        }
+        reported: set[str] = set()
+
+        for row_number, row in enumerate(rows, start=2):
+            for field, value in zip(SOV_REQUIRED_FIELDS, row):
+                if value is None or field in reported:
+                    continue
+
+                allowed = expected[FIELD_TYPES[field]]
+
+                if isinstance(value, bool) or not isinstance(value, allowed):
+                    problems.append(
+                        f"{field} row {row_number}: {value!r} is not "
+                        f"{FIELD_TYPES[field]}"
+                    )
+                    reported.add(field)
+
+                elif field in ALLOWED_VALUES and value not in ALLOWED_VALUES[field]:
+                    problems.append(
+                        f"{field} row {row_number}: {value!r} is not an allowed value"
+                    )
+                    reported.add(field)
+    finally:
+        workbook.close()
+
+    with zipfile.ZipFile(path) as archive:
+        for name in archive.namelist():
+            if name.startswith("xl/worksheets/") and b"<mergeCell" in archive.read(name):
+                problems.append("sheet contains merged cells")
                 break
 
     return problems

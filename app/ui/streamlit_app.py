@@ -82,8 +82,9 @@ def sidebar() -> None:
     )
     explain = st.sidebar.toggle(
         "LLM business-impact notes",
-        value=False,
+        value=use_llm,
         disabled=not use_llm,
+        help="One batched call explaining the items that need your decision.",
     )
     use_memory = st.sidebar.toggle(
         "Learn from reviewed mappings",
@@ -110,7 +111,7 @@ def sidebar() -> None:
             use_llm=use_llm,
             use_memory=use_memory,
         )
-        run.quality_agent.explain_with_llm = explain
+        run.quality_agent.explain_with_llm = explain and use_llm
 
         with st.spinner(
             "Running Agents 1-3 (the first run loads the language models)..."
@@ -587,21 +588,25 @@ def tab_export(run: PipelineRun) -> None:
 
     if result is not None:
         if result.schema_valid:
-            st.success("Schema validation passed: 17 columns in order, correct types, no merged cells.")
+            st.success(
+                "Schema validation passed: single sheet 'Cleaned_SOV', 17 columns "
+                "in order, correct types, no merged cells."
+            )
         else:
             st.error("Schema problems: " + "; ".join(result.schema_problems))
 
-        col1, col2 = st.columns(2)
-        col1.download_button(
-            "Download Cleaned_SOV.xlsx",
-            Path(result.output_path).read_bytes(),
-            file_name="Cleaned_SOV.xlsx",
-        )
-        col2.download_button(
-            "Download Audit_Log.json",
-            Path(result.audit_json_path).read_bytes(),
-            file_name="Audit_Log.json",
-        )
+        downloads = [
+            ("Download Cleaned_SOV.xlsx", result.output_path, "Cleaned_SOV.xlsx"),
+            ("Download Audit_Log.xlsx", result.audit_xlsx_path, "Audit_Log.xlsx"),
+            ("Download Audit_Log.json", result.audit_json_path, "Audit_Log.json"),
+            ("Download processing summary", result.summary_path, "Processing_Summary.md"),
+        ]
+
+        for column, (label, path, name) in zip(st.columns(len(downloads)), downloads):
+            column.download_button(label, Path(path).read_bytes(), file_name=name)
+
+        with st.expander("Processing summary"):
+            st.markdown(Path(result.summary_path).read_text(encoding="utf-8"))
 
         audit = json.loads(Path(result.audit_json_path).read_text(encoding="utf-8"))
         st.write("**Audit log**")

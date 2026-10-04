@@ -47,6 +47,33 @@ def _candidate_to_dict(candidate) -> dict:
     }
 
 
+def mask_sample(value: object) -> str:
+    """
+    Replace letters/digits with a/A/9 in values that may identify a
+    person, company or address: three or more words, or two or more
+    words containing a digit. Short codes and single words are kept
+    ("TX", "Y", "1985", "Masonry"), so the model still sees the column's
+    kind of content.
+
+        "505 Gentry Memorial Hwy"     -> "999 Aaaaaa Aaaaaaaa Aaa"
+        "Sonae Client A Portugal SA"  -> "Aaaaa Aaaaaa A Aaaaaaaa AA"
+    """
+
+    text = str(value)
+    words = text.split()
+    sensitive = len(words) >= 3 or (
+        len(words) >= 2 and any(ch.isdigit() for ch in text)
+    )
+
+    if not sensitive:
+        return text
+
+    return "".join(
+        "9" if ch.isdigit() else "A" if ch.isupper() else "a" if ch.isalpha() else ch
+        for ch in text
+    )
+
+
 def build_llm_decision_context(
     pipeline_result: SemanticPipelineResult,
     sample_values: list[str] | None = None,
@@ -81,8 +108,10 @@ def build_llm_decision_context(
             ),
         }
 
-    # Never send more than five explicitly supplied samples.
-    safe_samples = list(sample_values or [])[:5]
+    # Never send more than five explicitly supplied samples, and send
+    # only the shape of values that could identify a person, company or
+    # address.
+    safe_samples = [mask_sample(value) for value in list(sample_values or [])[:5]]
 
     return LLMDecisionContext(
         source_header=pipeline_result.source_header,
