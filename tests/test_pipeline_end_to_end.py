@@ -409,6 +409,8 @@ def test_groq_client_retries_on_rate_limit(monkeypatch):
     from app.agents.schema_mapping import groq_client
 
     monkeypatch.setattr(groq_client.time, "sleep", lambda seconds: None)
+    # Waiting on the shared budget is covered by the limiter's own test.
+    monkeypatch.setattr(groq_client.RATE_LIMITER, "penalise", lambda seconds: None)
 
     class RateLimited(Exception):
         status_code = 429
@@ -423,6 +425,7 @@ def test_groq_client_retries_on_rate_limit(monkeypatch):
             return "ok"
 
     client = groq_client.GroqLLMClient.__new__(groq_client.GroqLLMClient)
+    client.model = "openai/gpt-oss-120b"
     client.client = type("C", (), {"chat": type("Ch", (), {"completions": Completions()})()})()
 
     assert client._create_with_retry(model="m", messages=[]) == "ok"
@@ -608,3 +611,157 @@ def test_llm_samples_are_masked():
     assert mask_sample("Sonae Client A Portugal SA") == "Aaaaa Aaaaaa A Aaaaaaaa AA"
     assert mask_sample("TX") == "TX"
     assert mask_sample("Masonry") == "Masonry"
+
+
+# ---------------------------------------------------------------------
+# LLM rate limiting and batching
+# ---------------------------------------------------------------------
+
+
+def test_rate_limiter_waits_instead_of_exceeding_budget(monkeypatch):
+    from app import llm_rate_limiter as module
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(module.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(module.time, "sleep", lambda s: clock.__setitem__("now", clock["now"] + s))
+
+    limiter = module.TokenRateLimiter(1000)
+    limiter.acquire(800)
+    start = clock["now"]
+    limiter.acquire(800)  # must wait for the first call to leave the window
+
+    assert clock["now"] - start >= 59
+
+
+class BatchMappingClient:
+    """Fake LLM that resolves every column of a batch in one call."""
+
+    BATCH_SIZE = 8
+
+    def __init__(self):
+        self.calls = []
+
+    def decide_batch(self, contexts):
+        self.calls.append([c.source_header for c in contexts])
+        return {
+            c.source_header: LLMMappingDecision(
+                target_field="Fire Sprinklers (Y/N)" if "prot" in c.source_header.lower() else None,
+                confidence=0.8,
+                reason="test",
+            )
+            for c in contexts
+        }
+
+    def decide(self, context):
+        raise AssertionError("per-column calls must not happen when batching")
+
+
+def test_agent2_batches_llm_calls():
+    from app.agents.schema_mapping.agent import SchemaMappingInput
+
+    headers = ["Fire Prot.", "Zqx 1", "Zqx 2", "Zqx 3", "Zqx 4", "Zqx 5", "Zqx 6", "Zqx 7", "Zqx 8", "Zqx 9"]
+    client = BatchMappingClient()
+
+    result = SchemaMappingAgent(llm_client=client).map(
+        SchemaMappingInput(source_headers=headers, sample_values={"Fire Prot.": ["Y", "N", "Y"]})
+    )
+
+    assert sum(len(batch) for batch in client.calls) <= len(headers)
+    assert len(client.calls) <= 2
+    mapped = {m.source_header: m.target_field for m in result.mappings}
+    assert mapped["Fire Prot."] == "Fire Sprinklers (Y/N)"
+
+
+class RateLimitedBatchClient(BatchMappingClient):
+    def decide_batch(self, contexts):
+        raise RuntimeError("Error code: 429 - Rate limit reached for model")
+
+
+def test_rate_limit_failures_give_one_readable_warning():
+    from app.agents.schema_mapping.agent import SchemaMappingInput
+
+    headers = [f"Zqx {i}" for i in range(12)] + ["No. Floors"]
+
+    result = SchemaMappingAgent(llm_client=RateLimitedBatchClient()).map(
+        SchemaMappingInput(source_headers=headers, sample_values={"No. Floors": ["1", "2", "3"]})
+    )
+
+    assert len(result.warnings) == 1
+    assert "rate limit" in result.warnings[0]
+    assert {m.source_header: m.target_field for m in result.mappings}["No. Floors"] == "Storeys"
+
+
+DAILY_LIMIT_MESSAGE = (
+    "Error code: 429 - {'error': {'message': 'Rate limit reached for model "
+    "`openai/gpt-oss-120b` on tokens per day (TPD): Limit 200000, Used 198720, "
+    "Requested 1783. Please try again in 3m37.296s.'}}"
+)
+
+
+def test_retry_hint_parsing():
+    from app.llm_rate_limiter import parse_retry_after
+
+    assert parse_retry_after("Please try again in 3m37.296s.") == pytest.approx(217.296)
+    assert parse_retry_after("try again in 1h2m3s") == 3723
+    assert parse_retry_after("try again in 194.9ms") == pytest.approx(0.1949)
+    assert parse_retry_after("no hint") is None
+
+
+def test_daily_quota_stops_llm_calls_immediately(monkeypatch):
+    from app.agents.schema_mapping import groq_client
+    from app.llm_rate_limiter import RATE_LIMITER, LLMUnavailableError
+
+    sleeps = []
+    monkeypatch.setattr(groq_client.time, "sleep", sleeps.append)
+    calls = {"n": 0}
+
+    class Quota(Exception):
+        status_code = 429
+
+    class Completions:
+        def create(self, **request):
+            calls["n"] += 1
+            raise Quota(DAILY_LIMIT_MESSAGE)
+
+    client = groq_client.GroqLLMClient.__new__(groq_client.GroqLLMClient)
+    client.model = "openai/gpt-oss-120b"
+    client.client = type("C", (), {"chat": type("Ch", (), {"completions": Completions()})()})()
+
+    with pytest.raises(LLMUnavailableError):
+        client._create_with_retry(model="m", messages=[])
+
+    assert calls["n"] == 1 and sleeps == []  # no waiting on a daily quota
+
+    with pytest.raises(LLMUnavailableError):  # later calls do not even try
+        client._create_with_retry(model="m", messages=[])
+
+    assert calls["n"] == 1
+    assert "daily token quota" in RATE_LIMITER.blocked_reason
+
+
+def test_daily_quota_gives_one_clear_warning():
+    from app.agents.schema_mapping.agent import SchemaMappingInput
+    from app.llm_rate_limiter import RATE_LIMITER, LLMUnavailableError
+
+    class QuotaClient(BatchMappingClient):
+        def decide_batch(self, contexts):
+            RATE_LIMITER.block(217, "The LLM provider's daily token quota is used up (resets in about 3m 37s); continuing without the LLM.")
+            raise LLMUnavailableError(RATE_LIMITER.blocked_reason)
+
+    headers = [f"Zqx {i}" for i in range(12)] + ["No. Floors"]
+    result = SchemaMappingAgent(llm_client=QuotaClient()).map(
+        SchemaMappingInput(source_headers=headers, sample_values={"No. Floors": ["1", "2", "3"]})
+    )
+
+    assert len(result.warnings) == 1
+    assert "daily token quota" in result.warnings[0]
+    assert {m.source_header: m.target_field for m in result.mappings}["No. Floors"] == "Storeys"
+
+
+def test_reasoning_effort_is_low_for_gpt_oss(monkeypatch):
+    from app.agents.schema_mapping.groq_client import with_reasoning_effort
+
+    monkeypatch.delenv("GROQ_REASONING_EFFORT", raising=False)
+
+    assert with_reasoning_effort("openai/gpt-oss-120b", {})["reasoning_effort"] == "low"
+    assert "reasoning_effort" not in with_reasoning_effort("llama-3.3-70b", {})

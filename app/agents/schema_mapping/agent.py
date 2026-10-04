@@ -138,6 +138,8 @@ class SchemaMappingAgent:
         self._llm_warnings: list[str] = []
         self._pipelines: dict = {}
         self._prefetched_decisions: dict = {}
+        self._batch_prefetched = False
+        self._llm_failures: list = []
 
     # ------------------------------------------------------------------
     # Utility
@@ -862,30 +864,25 @@ class SchemaMappingAgent:
                 continue
 
             # ============================================================
-            # CASE 3 — Semantic header + value evidence
+            # CASE 3 — Semantic or LLM header evidence + value evidence
+            #
+            # Use the stronger of the two. Checking semantic first meant
+            # a weak semantic score (e.g. 0.19) silently overrode a
+            # confident LLM decision (e.g. 0.72).
             # ============================================================
 
-            if semantic_score > 0.0:
+            header_score = max(semantic_score, llm_score)
+
+            if header_score > 0.0:
 
                 candidate["score"] = (
-                    0.80 * semantic_score
+                    0.80 * header_score
                     +
                     0.20 * value_score
                 )
 
-                continue
-
-            # ============================================================
-            # CASE 4 — LLM + value evidence
-            # ============================================================
-
-            if llm_score > 0.0:
-
-                candidate["score"] = (
-                    0.80 * llm_score
-                    +
-                    0.20 * value_score
-                )
+                if llm_score > semantic_score:
+                    candidate["method"] = "llm"
 
                 continue
 
@@ -1016,12 +1013,19 @@ class SchemaMappingAgent:
         # An LLM failure (network, malformed output) must not discard
         # the deterministic and semantic evidence gathered above.
         try:
-            prefetched = self._prefetched_decisions.get(source_header)
+            if source_header in self._prefetched_decisions:
+                prefetched = self._prefetched_decisions[source_header]
 
-            decision = (
-                prefetched.result()
-                if prefetched is not None
-                else resolve_mapping(
+                if isinstance(prefetched, Exception):
+                    raise prefetched
+
+                decision = prefetched
+            elif self._batch_prefetched:
+                # The batch already covered every column that needed
+                # the LLM; never fall back to one call per column.
+                decision = None
+            else:
+                decision = resolve_mapping(
                     pipeline,
                     sample_values=samples,
                     llm_client=(
@@ -1030,14 +1034,8 @@ class SchemaMappingAgent:
                         else self.llm_client
                     ),
                 )
-            )
         except Exception as exc:
-            message = str(exc).splitlines()[0] if str(exc) else type(exc).__name__
-            self._llm_warnings.append(
-                f"LLM fallback failed for '{source_header}' "
-                f"({message[:120]}); kept the deterministic and semantic "
-                "evidence."
-            )
+            self._llm_failures.append((source_header, exc))
             decision = None
 
         if (
@@ -1141,13 +1139,20 @@ class SchemaMappingAgent:
         warnings = []
 
         self._llm_warnings = warnings
+        self._llm_failures = []
         self._prefetch_llm_decisions(mapping_input)
 
         try:
-            return self._map_columns(mapping_input, column_evidence, warnings)
+            result = self._map_columns(mapping_input, column_evidence, warnings)
         finally:
             self._pipelines = {}
             self._prefetched_decisions = {}
+            self._batch_prefetched = False
+
+        if self._llm_failures:
+            warnings.append(summarise_llm_failures(self._llm_failures))
+
+        return result
 
     def _has_strong_header_match(self, source_header: str) -> bool:
         """Exact, alias or fuzzy evidence already decides the column."""
@@ -1202,17 +1207,75 @@ class SchemaMappingAgent:
         if not needs_llm:
             return
 
-        executor = ThreadPoolExecutor(max_workers=max_workers)
+        if hasattr(self.llm_client, "decide_batch"):
+            self._prefetch_in_batches(needs_llm, mapping_input, max_workers)
+            return
 
-        for header in needs_llm:
-            self._prefetched_decisions[header] = executor.submit(
+        executor = ThreadPoolExecutor(max_workers=max_workers)
+        futures = {
+            header: executor.submit(
                 resolve_mapping,
                 self._pipelines[header],
                 mapping_input.sample_values.get(header, []),
                 self.llm_client,
             )
+            for header in needs_llm
+        }
+        executor.shutdown(wait=True)
 
-        executor.shutdown(wait=False)
+        for header, future in futures.items():
+            try:
+                self._prefetched_decisions[header] = future.result()
+            except Exception as error:
+                self._prefetched_decisions[header] = error
+
+    def _prefetch_in_batches(
+        self,
+        headers: list[str],
+        mapping_input: SchemaMappingInput,
+        max_workers: int,
+    ) -> None:
+        """
+        One LLM request per batch of columns (see
+        GroqLLMClient.decide_batch); the shared token limiter paces
+        the requests so the free-tier budget is not exceeded.
+        """
+
+        from concurrent.futures import ThreadPoolExecutor
+
+        from app.agents.schema_mapping.decision_engine import (
+            decision_from_llm,
+        )
+        from app.agents.schema_mapping.llm_prompt import (
+            build_llm_decision_context,
+        )
+
+        size = getattr(self.llm_client, "BATCH_SIZE", 8)
+        batches = [headers[i:i + size] for i in range(0, len(headers), size)]
+        contexts = {
+            header: build_llm_decision_context(
+                self._pipelines[header],
+                sample_values=mapping_input.sample_values.get(header, []),
+            )
+            for header in headers
+        }
+
+        def run_batch(batch: list[str]) -> dict:
+            return self.llm_client.decide_batch([contexts[h] for h in batch])
+
+        with ThreadPoolExecutor(max_workers=max(1, min(max_workers, 2))) as executor:
+            results = list(zip(batches, executor.map(_safe(run_batch), batches)))
+
+        for batch, outcome in results:
+            for header in batch:
+                if isinstance(outcome, Exception):
+                    self._prefetched_decisions[header] = outcome
+                elif header in outcome:
+                    self._prefetched_decisions[header] = decision_from_llm(
+                        self._pipelines[header], outcome[header]
+                    )
+
+        self._batch_prefetched = True
 
     def _map_columns(
         self,
@@ -1401,3 +1464,47 @@ def build_mapping_json(
             else 0.0
         ),
     }
+
+
+def _safe(function):
+    """Return exceptions instead of raising (for executor.map)."""
+
+    def wrapper(*args):
+        try:
+            return function(*args)
+        except Exception as error:
+            return error
+
+    return wrapper
+
+
+def summarise_llm_failures(failures: list) -> str:
+    """One readable warning instead of one per column."""
+
+    from app.llm_rate_limiter import LLMUnavailableError
+
+    headers = [header for header, _ in failures]
+    unavailable = next(
+        (error for _, error in failures if isinstance(error, LLMUnavailableError)),
+        None,
+    )
+    rate_limited = any(
+        "429" in str(error) or "rate limit" in str(error).lower()
+        for _, error in failures
+    )
+
+    if unavailable is not None:
+        reason = str(unavailable).rstrip(".").replace("; continuing without the LLM", "")
+        reason = reason[0].lower() + reason[1:]
+    elif rate_limited:
+        reason = "the LLM provider's rate limit was reached"
+    else:
+        reason = f"the LLM call failed ({str(failures[0][1]).splitlines()[0][:100]})"
+    shown = ", ".join(f"'{h}'" for h in headers[:5])
+    more = f" and {len(headers) - 5} more" if len(headers) > 5 else ""
+
+    return (
+        f"LLM fallback skipped for {len(headers)} column(s) because {reason}: "
+        f"{shown}{more}. Their deterministic and semantic evidence was kept; "
+        "anything uncertain is in the review queue."
+    )

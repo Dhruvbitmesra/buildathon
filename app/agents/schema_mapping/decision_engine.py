@@ -116,6 +116,15 @@ def resolve_mapping(
 
     decision = llm_client.decide(context)
 
+    return decision_from_llm(pipeline_result, decision)
+
+
+def decision_from_llm(
+    pipeline_result: SemanticPipelineResult,
+    decision: LLMMappingDecision,
+) -> MappingDecisionResult:
+    """Wrap a (single or batched) LLM decision as a mapping decision."""
+
     # Enforce the human-review policy at the orchestration
     # boundary as well as inside the LLM client.
     decision = validate_llm_decision(decision)

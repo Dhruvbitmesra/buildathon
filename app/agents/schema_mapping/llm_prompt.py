@@ -29,6 +29,55 @@ Rules:
 """.strip()
 
 
+BATCH_INSTRUCTIONS = """
+You receive several source columns at once. Decide each column
+independently using only its own evidence. Return JSON only:
+
+{"decisions": {"<source_header>": {"target_field": "<canonical field or null>",
+  "confidence": <0.0-1.0>, "reason": "<short reason>",
+  "human_review_required": <true|false>}, ...}}
+
+Use each source_header exactly as given as the key.
+""".strip()
+
+
+def build_batch_payload(contexts) -> str:
+    """Compact JSON evidence for several columns (top 3 candidates each)."""
+
+    import json
+
+    from app.agents.schema_mapping.target_schema import TARGET_FIELDS
+
+    columns = []
+
+    for context in contexts:
+        columns.append(
+            {
+                "source_header": context.source_header,
+                "normalized_header": context.normalized_header,
+                "candidates": [
+                    {
+                        "target_field": c.get("target_field"),
+                        "score": round(float(c.get("score", 0.0)), 3),
+                        "embedding_similarity": round(
+                            float(c.get("embedding_similarity", 0.0)), 3
+                        ),
+                    }
+                    for c in context.candidates[:3]
+                ],
+                "masked_samples": context.sample_values[:5],
+            }
+        )
+
+    return json.dumps(
+        {
+            "canonical_target_fields": [field.name for field in TARGET_FIELDS],
+            "columns": columns,
+        },
+        default=str,
+    )
+
+
 def _candidate_to_dict(candidate) -> dict:
     """Convert a semantic candidate into LLM-safe evidence."""
 

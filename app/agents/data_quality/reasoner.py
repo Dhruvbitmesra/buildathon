@@ -318,26 +318,62 @@ class GroqReasoner:
             _retry_delay,
         )
 
-        for attempt in range(1, 4):
+        from app.agents.schema_mapping.groq_client import (
+            _rejects_reasoning_effort,
+            stop_if_quota_exhausted,
+            with_reasoning_effort,
+        )
+        from app.llm_rate_limiter import (
+            RATE_LIMITER,
+            LLMUnavailableError,
+            estimate_tokens,
+        )
+
+        user = json.dumps(payload, default=str)
+        request = with_reasoning_effort(
+            self.model,
+            {
+                "model": self.model,
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user},
+                ],
+                "temperature": 0,
+                "response_format": {"type": "json_object"},
+            },
+        )
+
+        for attempt in range(1, 5):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {
-                            "role": "user",
-                            "content": json.dumps(payload, default=str),
-                        },
-                    ],
-                    temperature=0,
-                    response_format={"type": "json_object"},
+                reservation = RATE_LIMITER.acquire(
+                    estimate_tokens(system_prompt, user, completion=2000)
                 )
-                return response.choices[0].message.content or None
+            except LLMUnavailableError:
+                return None
+
+            try:
+                response = self.client.chat.completions.create(**request)
             except Exception as error:
-                if attempt == 3 or not _is_rate_limit(error):
+                if _rejects_reasoning_effort(error) and "reasoning_effort" in request:
+                    request = {k: v for k, v in request.items() if k != "reasoning_effort"}
+                    continue
+
+                if attempt == 4 or not _is_rate_limit(error):
                     return None
 
-                time.sleep(_retry_delay(error, attempt, 15.0))
+                try:
+                    stop_if_quota_exhausted(error, 20.0)
+                except LLMUnavailableError:
+                    return None
+
+                delay = _retry_delay(error, attempt, 20.0)
+                RATE_LIMITER.penalise(delay)
+                time.sleep(delay)
+                continue
+
+            usage = getattr(response, "usage", None)
+            RATE_LIMITER.record(reservation, getattr(usage, "total_tokens", None))
+            return response.choices[0].message.content or None
 
         return None
 
@@ -366,7 +402,9 @@ def masked_summary(recommendation: Recommendation) -> dict[str, Any]:
             mask(value) for value in recommendation.evidence.observed_values[:5]
         ],
         "proposed_value": mask(recommendation.after_value),
-        "rationale": recommendation.rationale,
+        # Trimmed: the title and rule carry the meaning; long rationales
+        # only cost tokens.
+        "title": recommendation.title[:160],
     }
 
 
