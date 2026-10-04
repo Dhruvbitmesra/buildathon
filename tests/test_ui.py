@@ -32,32 +32,81 @@ def test_coerce_edit_value_rejects_bad_numbers():
         coerce_edit_value("Storeys", "two")
 
 
-@pytest.mark.skipif(not SAMPLE.exists(), reason="sample not present")
-def test_streamlit_review_flow(tmp_path):
+def _app(run, tab="Review", reviewer="tester"):
     streamlit_testing = pytest.importorskip("streamlit.testing.v1")
-    from app.pipeline import PipelineRun
-
-    run = PipelineRun(str(SAMPLE), output_dir=tmp_path, use_llm=False)
-    assert run.analyse()
-
-    dot = workflow_dot(run)
-    assert "Agent 1" in dot and "re-reason" in dot
 
     app = streamlit_testing.AppTest.from_file(str(APP), default_timeout=120)
     app.session_state["run"] = run
-    app.session_state["reviewer"] = "tester"
+    app.session_state["active_tab"] = tab
+
+    if reviewer:
+        app.session_state["reviewer"] = reviewer
+
+    return app
+
+
+def _analysed(tmp_path):
+    from app.pipeline import PipelineRun
+
+    run = PipelineRun(str(SAMPLE), output_dir=tmp_path, use_llm=False, use_memory=False)
+    assert run.analyse()
+    return run
+
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="sample not present")
+def test_review_actions_keep_the_review_tab(tmp_path):
+    run = _analysed(tmp_path)
+    app = _app(run)
     app.run()
 
+    approve = next(b for b in app.button if (b.key or "").startswith("approve-"))
+    pending = len(run.session.ledger.pending())
+    approve.click().run()
+
     assert not app.exception
-    assert any("Review" in tab.label for tab in app.tabs)
+    assert app.session_state["active_tab"] == "Review"
+    assert len(run.session.ledger.pending()) == pending - 1
+    assert app.toast[0].value.startswith("Approved:")
+
+    next(b for b in app.button if b.label.startswith("Approve All")).click().run()
+
+    assert not app.exception
+    assert app.session_state["active_tab"] == "Review"
+
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="sample not present")
+def test_decisions_need_a_reviewer_name(tmp_path):
+    app = _app(_analysed(tmp_path), reviewer=None)
+    app.run()
+
+    approve = next(b for b in app.button if (b.key or "").startswith("approve-"))
+
+    assert approve.disabled
+    assert any("your name" in w.value for w in app.warning)
+
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="sample not present")
+def test_every_tab_renders(tmp_path):
+    run = _analysed(tmp_path)
+
+    assert "Agent 1" in workflow_dot(run) and "re-reason" in workflow_dot(run)
+
+    for tab in ["Overview", "Sheets", "Mapping", "Data quality", "Review", "Export"]:
+        app = _app(run, tab=tab)
+        app.run()
+        assert not app.exception, tab
+
+
+@pytest.mark.skipif(not SAMPLE.exists(), reason="sample not present")
+def test_export_from_the_ui(tmp_path):
+    from app.agents.data_quality.recommendation_schema import ReviewAction
+
+    run = _analysed(tmp_path)
+    app = _app(run, tab="Export")
+    app.run()
 
     export = next(b for b in app.button if b.label == "Export Cleaned_SOV.xlsx")
     assert export.disabled  # FR-5: blocked while items are pending
-
-    next(b for b in app.button if b.label.startswith("Approve All")).click().run()
-    assert not app.exception
-
-    from app.agents.data_quality.recommendation_schema import ReviewAction
 
     for rec in list(run.session.ledger.pending()):
         run.submit(ReviewAction(recommendation_id=rec.recommendation_id, decision="approve", reviewer="tester"))
@@ -66,6 +115,7 @@ def test_streamlit_review_flow(tmp_path):
     next(b for b in app.button if b.label == "Export Cleaned_SOV.xlsx").click().run()
 
     assert not app.exception
+    assert app.session_state["active_tab"] == "Export"
     assert run.export_result is not None and run.export_result.schema_valid
     assert {b.label for b in app.get("download_button")} == {
         "Download Cleaned_SOV.xlsx",
