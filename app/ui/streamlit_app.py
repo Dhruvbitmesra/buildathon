@@ -482,7 +482,17 @@ def review_form(run: PipelineRun, item, reviewer: str) -> None:
                     key=f"editor-{rec.recommendation_id}",
                 )
 
-        submitted = st.form_submit_button("Submit decision", disabled=not reviewer)
+        # Every decision is recorded with its reviewer (audit: approved_by),
+        # so submitting needs a name.
+        if not reviewer:
+            st.warning(
+                "Enter your name in **Reviewer name** (left sidebar) and "
+                "press Enter to enable Submit."
+            )
+
+        submitted = st.form_submit_button(
+            "Submit decision", type="primary", disabled=not reviewer
+        )
 
     if not submitted:
         return
@@ -640,6 +650,9 @@ def main() -> None:
 
     if flash:
         st.success(flash)
+        # Also a pop-up: the success banner is at the top of the page,
+        # out of view when the reviewer is deep in the queue.
+        st.toast(flash)
 
     tabs = st.tabs(
         ["Workflow", "1 · Sheets", "2 · Mapping", "3 · Data quality",
