@@ -4,3 +4,7 @@ borderRadius = "medium"
 
 [server]
 maxUploadSize = 50
+# The source watcher probes every loaded module on each rerun; probing the
+# transformers library logs torchvision import errors and slows reruns.
+# Restart the app after code changes instead.
+fileWatcherType = "none"
