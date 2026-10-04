@@ -88,14 +88,33 @@ def resolve_mapping(
     if semantic_result is not None:
         return semantic_result
 
+    # No client means the caller chose deterministic-only mapping.
+    # Never create one implicitly: a missing API key would otherwise
+    # raise and discard every other piece of evidence for the column.
+    if llm_client is None:
+        return MappingDecisionResult(
+            source_header=pipeline_result.source_header,
+            target_field=None,
+            confidence=0.0,
+            method="no_llm",
+            human_review_required=True,
+            reason=(
+                "Semantic evidence was inconclusive and no LLM client "
+                "is configured; the column needs human review."
+            ),
+            semantic_category=(
+                pipeline_result.evaluation.category
+                if pipeline_result.evaluation
+                else None
+            ),
+        )
+
     context = build_llm_decision_context(
         pipeline_result,
         sample_values=sample_values,
     )
 
-    client = llm_client or GroqLLMClient()
-
-    decision = client.decide(context)
+    decision = llm_client.decide(context)
 
     # Enforce the human-review policy at the orchestration
     # boundary as well as inside the LLM client.

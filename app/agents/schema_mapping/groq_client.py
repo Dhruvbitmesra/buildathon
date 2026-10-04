@@ -1,4 +1,6 @@
 import os
+import re
+import time
 
 from dotenv import load_dotenv
 from groq import Groq
@@ -53,7 +55,7 @@ class GroqLLMClient:
 
         user_prompt = build_llm_user_prompt(context)
 
-        response = self.client.chat.completions.create(
+        response = self._create_with_retry(
             model=self.model,
             messages=[
                 {
@@ -83,3 +85,45 @@ class GroqLLMClient:
         )
 
         return validate_llm_decision(decision)
+
+    MAX_RETRIES = 3
+    MAX_WAIT_SECONDS = 15.0
+
+    def _create_with_retry(self, **request):
+        """
+        Call the chat API, waiting and retrying on rate-limit (429)
+        responses. Groq's free tier allows ~8k tokens/minute, which a
+        single SOV file can exceed.
+        """
+
+        attempt = 0
+
+        while True:
+            try:
+                return self.client.chat.completions.create(**request)
+            except Exception as error:
+                attempt += 1
+
+                if attempt > self.MAX_RETRIES or not _is_rate_limit(error):
+                    raise
+
+                time.sleep(_retry_delay(error, attempt, self.MAX_WAIT_SECONDS))
+
+
+def _is_rate_limit(error: Exception) -> bool:
+    status = getattr(error, "status_code", None)
+    return status == 429 or "rate limit" in str(error).lower()
+
+
+def _retry_delay(error: Exception, attempt: int, cap: float) -> float:
+    """Use the server's "try again in Xs" hint, else exponential backoff."""
+
+    match = re.search(r"try again in ([\d.]+)\s*(ms|s)", str(error))
+
+    if match:
+        seconds = float(match.group(1))
+        if match.group(2) == "ms":
+            seconds /= 1000
+        return min(seconds + 0.5, cap)
+
+    return min(2.0 ** attempt, cap)

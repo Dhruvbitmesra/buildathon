@@ -13,3 +13,5 @@ chroma_db/
 
 .vscode/
 .idea/
+output/
+memory/

@@ -1,3 +1,87 @@
+# SOVereign AI — Agentic SOV Cleansing & Intelligence System
+
+Four collaborating agents turn a client's Statement of Values (any layout)
+into a schema-conformant `Cleaned_SOV.xlsx`, with a human approving every
+change.
+
+```text
+Upload ─► Agent 1 Sheet Discovery ─► Agent 2 Schema Mapping ─► Agent 3 Data Quality & Reasoning
+                                                                      │   ▲ reject + note
+                                                                      ▼   │ (re-reason, max 2)
+                                                               Human Review (UI)
+                                                                      │ all items decided
+                                                                      ▼
+                                                  Agent 4 Controlled Transformation
+                                                                      ▼
+                                                  Cleaned_SOV.xlsx + Audit_Log
+```
+
+All agents share one typed state object (`app/state/sov_state.py`).
+
+## Setup
+
+```bash
+uv sync                      # Python 3.13
+cp .env.example .env         # optional: GROQ_API_KEY=... enables LLM reasoning
+```
+
+The first run downloads two small Hugging Face models (embeddings and a
+cross-encoder); later runs use the local cache.
+
+## Run the web app (recommended)
+
+```bash
+uv run streamlit run app/ui/streamlit_app.py
+```
+
+Upload an `.xlsx`/`.csv`, enter your name, click **Analyse file**, then
+work through the tabs: Workflow · Sheets · Mapping · Data quality ·
+Review · Preview & export. Export is enabled only when every
+recommendation has a decision.
+
+## Run from the command line
+
+```bash
+uv run python -m app.main data/input/SOV_H6D2.xlsx                 # stops at review
+uv run python -m app.main data/input/SOV_H6D2.xlsx --approve bulk  # Approve All (>= 0.90, lossless)
+uv run python -m app.main FILE --decisions decisions.json --reviewer alice
+uv run python -m app.main FILE --no-llm --no-memory                # deterministic, no learning
+```
+
+Outputs go to `output/<file>_<ext>/`: `sheet_manifest.json`,
+`schema_mapping.json`, `quality_report.json`, `review_queue.json`, and
+after export `Cleaned_SOV.xlsx`, `Audit_Log.json`, `agent_trace.json`.
+
+## Evaluate
+
+```bash
+uv run pytest                                          # full suite
+uv run python -m tests.evaluate_mapping_accuracy       # mapping accuracy on the samples
+uv run python -m tests.evaluate_unseen_variants        # held-out: unseen headers/layouts
+uv run python -m tests.evaluate_agent3_real            # anomaly recall on the samples
+```
+
+The sample files were used during development, so their scores are
+optimistic; `evaluate_unseen_variants` reports a held-out split that was
+never used for tuning. Real unseen files from the team are the best
+test: label them in `tests/evaluate_mapping_accuracy.py` and run it.
+
+## Guarantees
+
+- No change is applied without an explicit human decision (C-01).
+- Missing values stay blank; nothing is invented (C-02).
+- Every recommendation carries a rationale, uncertainty and before/after
+  values (NFR-6); every applied change is in the audit log (NFR-3).
+- Only headers (never row values) are stored in mapping memory; names
+  and addresses are masked before any LLM call in Agent 3.
+
+## Documentation
+
+`docs/STEP_*.md` record each step; `docs/DEMO_SCRIPT.md` walks through
+the 7 demo stages.
+
+---
+
 Statistical + Bayesian Column Mapping — Short Documentation
 1. Purpose
 The SOV files can have different column names for the same insurance field.

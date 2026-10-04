@@ -385,7 +385,13 @@ def assign_one_to_one(
                 source_header=evidence.source_header,
                 target_field=target_field,
                 score=float(score),
-                method="global_assignment",
+                # Report how the match was found (exact / domain_alias /
+                # fuzzy / semantic / llm), as FR-2 requires.
+                method=(
+                    method
+                    if method not in {"unknown", "None"}
+                    else "global_assignment"
+                ),
                 human_review_required=False,
                 reason=reason,
             )

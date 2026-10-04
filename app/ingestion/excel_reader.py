@@ -19,33 +19,34 @@ def read_excel_file(
             Basic metadata about each worksheet.
     """
 
-    # Open the workbook
-    workbook = pd.ExcelFile(file_path)
-
     sheet_data = {}
     sheet_info = []
 
-    # Process every worksheet
-    for sheet_name in workbook.sheet_names:
+    # Open the workbook in a context manager so the file handle is
+    # released (on Windows an open handle locks the uploaded file).
+    with pd.ExcelFile(file_path) as workbook:
 
-        # Read without assuming where the header is
-        df = pd.read_excel(
-            workbook,
-            sheet_name=sheet_name,
-            header=None,
-        )
+        # Process every worksheet
+        for sheet_name in workbook.sheet_names:
 
-        # Store raw DataFrame
-        sheet_data[sheet_name] = df
-
-        # Store basic sheet metadata
-        sheet_info.append(
-            SheetInfo(
-                name=sheet_name,
-                rows=len(df),
-                columns=len(df.columns),
-                is_empty=df.empty,
+            # Read without assuming where the header is
+            df = pd.read_excel(
+                workbook,
+                sheet_name=sheet_name,
+                header=None,
             )
-        )
+
+            # Store raw DataFrame
+            sheet_data[sheet_name] = df
+
+            # Store basic sheet metadata
+            sheet_info.append(
+                SheetInfo(
+                    name=sheet_name,
+                    rows=len(df),
+                    columns=len(df.columns),
+                    is_empty=df.empty,
+                )
+            )
 
     return sheet_data, sheet_info

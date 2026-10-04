@@ -73,17 +73,28 @@ def _normalize_similarity(
     )
 
 
+# Target-schema embeddings never change for a given model; encoding
+# them once per process instead of once per source column removes most
+# of Agent 2's per-column cost.
+_TARGET_EMBEDDING_CACHE: dict[int, tuple[list[str], np.ndarray]] = {}
+
+
 def _build_target_embeddings(
     model: SentenceTransformer,
 ) -> tuple[list[str], np.ndarray]:
     """
-    Build embeddings for the canonical target schema.
+    Build (or reuse) embeddings for the canonical target schema.
 
     Returns:
 
         target field names
         normalized embedding matrix
     """
+
+    cached = _TARGET_EMBEDDING_CACHE.get(id(model))
+
+    if cached is not None:
+        return cached
 
     target_names: list[str] = []
 
@@ -101,6 +112,8 @@ def _build_target_embeddings(
         convert_to_numpy=True,
         show_progress_bar=False,
     )
+
+    _TARGET_EMBEDDING_CACHE[id(model)] = (target_names, embeddings)
 
     return target_names, embeddings
 

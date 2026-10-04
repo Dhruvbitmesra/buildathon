@@ -105,3 +105,37 @@ def test_fire_sprinkler_fuzzy_match():
 
     assert result.matched_field == "Fire Sprinklers (Y/N)"
     assert result.confidence >= 0.75
+
+
+def test_generic_building_is_not_mapped_to_number_of_buildings():
+    result = fuzzy_match_header("Building")
+
+    assert not (
+        result.matched_field == "Number of Buildings"
+        and result.deterministic
+        and result.confidence >= 0.75
+    )
+
+
+def test_number_of_buildings_still_matches():
+    result = fuzzy_match_header("Number of Buildings")
+
+    assert result.matched_field == "Number of Buildings"
+    assert result.deterministic
+    assert result.confidence >= 0.75
+
+
+def test_building_count_still_matches_number_of_buildings():
+    result = fuzzy_match_header("Building Count")
+
+    assert result.matched_field == "Number of Buildings"
+    assert result.deterministic
+    assert result.confidence >= 0.75
+
+
+def test_building_value_still_matches_building_value():
+    result = fuzzy_match_header("Building Value")
+
+    assert result.matched_field == "Building Value"
+    assert result.deterministic
+    assert result.confidence >= 0.75

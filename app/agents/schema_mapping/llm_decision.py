@@ -34,6 +34,23 @@ class LLMMappingDecision(BaseModel):
 
     human_review_required: bool = False
 
+    @field_validator("confidence", mode="before")
+    @classmethod
+    def coerce_verbal_confidence(cls, value):
+        """
+        Models sometimes answer "high" instead of a number. Map the
+        common words conservatively instead of failing the column.
+        """
+
+        if isinstance(value, str):
+            verbal = {"high": 0.85, "medium": 0.6, "low": 0.3}
+            text = value.strip().lower()
+
+            if text in verbal:
+                return verbal[text]
+
+        return value
+
     @field_validator("target_field")
     @classmethod
     def validate_target_field(

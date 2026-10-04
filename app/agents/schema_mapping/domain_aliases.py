@@ -37,6 +37,9 @@ DOMAIN_ALIASES: dict[str, list[str]] = {
         "loc number",
         "loc no",
         "loc id",
+        "item number",
+        "item no",
+        "location no",
     ],
 
     # ------------------------------------------------------------------------
@@ -207,6 +210,7 @@ DOMAIN_ALIASES: dict[str, list[str]] = {
         "occupancy description",
         "occupancy code",
         "occupancy classification",
+        "insured occupancy",
     ],
 
     # ------------------------------------------------------------------------
@@ -309,6 +313,9 @@ DOMAIN_ALIASES: dict[str, list[str]] = {
         "percent sprinklered",
         "% sprinklered",
         "fire protection sprinkler",
+        "sprk",
+        "sprink",
+        "sprinkler percent",
     ],
 
     # ------------------------------------------------------------------------

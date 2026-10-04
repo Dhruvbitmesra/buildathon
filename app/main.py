@@ -1,44 +1,112 @@
-from app.ingestion.loader import load_sov_file
+"""
+Command-line entry point for the SOV pipeline.
+
+    python -m app.main data/input/SOV_H6D2.xlsx
+    python -m app.main data/input/SOV_H6D2.xlsx --approve bulk
+    python -m app.main data/input/SOV_H6D2.xlsx --decisions decisions.json
+    python -m app.main data/input/SOV_H6D2.xlsx --approve all --no-llm
+
+Without an approval option the pipeline stops at the human review gate
+and writes output/<file>/review_queue.json. Cleaned_SOV.xlsx is written
+only once every recommendation has a decision.
+"""
+
+import argparse
+import sys
+from pathlib import Path
+
+from app.pipeline import run_pipeline
 
 
-def print_state_summary(state):
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="SOVereign AI pipeline")
+    parser.add_argument("file", help="SOV file (.xlsx, .xls or .csv)")
+    parser.add_argument(
+        "--output",
+        default=None,
+        help="output directory (default: output/<file name>)",
+    )
+    parser.add_argument(
+        "--approve",
+        choices=["none", "bulk", "all"],
+        default="none",
+        help=(
+            "none: stop at review; bulk: approve only bulk-approvable "
+            "items; all: approve every item as the named reviewer"
+        ),
+    )
+    parser.add_argument("--reviewer", default="cli-reviewer")
+    parser.add_argument("--decisions", help="JSON file of review decisions")
+    llm = parser.add_mutually_exclusive_group()
+    llm.add_argument("--llm", dest="use_llm", action="store_true", default=None)
+    llm.add_argument("--no-llm", dest="use_llm", action="store_false")
+    parser.add_argument(
+        "--no-memory",
+        dest="use_memory",
+        action="store_false",
+        help="do not use or update the memory of reviewed mappings",
+    )
+    args = parser.parse_args(argv)
 
-    print("\n" + "=" * 60)
-    print("SOV INGESTION SUMMARY")
-    print("=" * 60)
+    # Include the extension so sample.csv and sample.xlsx do not
+    # overwrite each other's output.
+    source = Path(args.file)
+    output_dir = args.output or str(
+        Path("output") / f"{source.stem}_{source.suffix.lstrip('.')}"
+    )
 
-    print(f"\nFile Name: {state.file_name}")
-    print(f"File Type: {state.file_type}")
-
-    print("\nSheets:")
-    print("-" * 60)
-
-    for sheet in state.sheets:
-
-        print(
-            f"{sheet.name:<20}"
-            f"Rows: {sheet.rows:<8}"
-            f"Columns: {sheet.columns:<8}"
-            f"Empty: {sheet.is_empty}"
+    try:
+        result = run_pipeline(
+            args.file,
+            output_dir=output_dir,
+            use_llm=args.use_llm,
+            approve=args.approve,
+            reviewer=args.reviewer,
+            decisions_file=args.decisions,
+            use_memory=args.use_memory,
         )
+    except Exception as error:  # last-resort guard (NFR-4)
+        print(f"ERROR: unexpected failure: {error}")
+        return 2
 
-    print("\nSelected Sheet:")
-    print(state.selected_sheet)
+    state = result.state
 
-    print("\nErrors:")
-    print(state.errors)
+    print("=" * 64)
+    print(f"SOV PIPELINE  {args.file}")
+    print("=" * 64)
 
-    print("\nWarnings:")
-    print(state.warnings)
+    if state is not None:
+        print(f"Sheet:   {state.selected_sheet} (header row "
+              f"{state.header_row + 1 if state.header_row is not None else '-'})")
+        mapping = state.metadata.get("schema_mapping_json")
 
+        if mapping:
+            mapped = sum(1 for m in mapping["mappings"].values() if m["target"])
+            print(f"Mapping: {mapped} mapped, {mapping['unresolved_count']} "
+                  f"unresolved, overall confidence {mapping['overall_confidence']}")
 
-def main():
+        if state.quality_report is not None:
+            report = state.quality_report
+            print(f"Quality: {report.total_issues} issues, intake score "
+                  f"{report.intake_quality_score}")
 
-    file_path = "data/input/sample_sov.csv"
-    state = load_sov_file(file_path)
+        if state.review_ledger is not None:
+            print(f"Review:  {state.review_ledger.summary()}")
 
-    print_state_summary(state)
+        for warning in state.warnings:
+            print(f"WARNING: {warning}")
+
+    for stage, seconds in result.timings.items():
+        print(f"  {stage:<16} {seconds:6.1f}s")
+
+    for name, path in result.artifacts.items():
+        print(f"  -> {name}: {path}")
+
+    for error in result.errors:
+        print(f"{'NOTE' if result.ok else 'ERROR'}: {error}")
+
+    return 0 if result.ok else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

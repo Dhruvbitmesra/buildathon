@@ -48,12 +48,110 @@ def build_fuzzy_candidates() -> dict[str, str]:
                 )
 
     for alias, target_field in DOMAIN_ALIAS_LOOKUP.items():
-        candidates.setdefault(alias, target_field)
+        normalized_alias = normalize_header(alias)
+
+        if normalized_alias:
+            candidates.setdefault(
+                normalized_alias,
+                target_field,
+            )
 
     return candidates
 
 
 FUZZY_CANDIDATES = build_fuzzy_candidates()
+
+
+def _tokenize(text: str) -> set[str]:
+    """
+    Convert normalized text into a set of tokens.
+    """
+    return set(text.split())
+
+
+_STOPWORDS = {"of", "the", "and", "per", "in"}
+_NUMBER_WORDS = {"number", "no", "nr", "num"}
+TOKEN_SIMILARITY = 0.85
+
+
+def _tokens_compatible(source_text: str, matched_text: str) -> bool:
+    """
+    True when every meaningful token of the matched vocabulary entry
+    has a close token in the source header. Extra source tokens are
+    allowed ("RMS Construction", "2023 Building Value"); a missing key
+    word is not ("Account Name" vs "county name"). Short tokens and
+    stopwords are ignored, so typos ("constrution") and plurals
+    ("floor"/"floors") still match.
+    """
+
+    def meaningful(text: str) -> list[str]:
+        return [
+            token
+            for token in text.split()
+            if token in _NUMBER_WORDS
+            or (len(token) >= 2 and token not in _STOPWORDS)
+        ]
+
+    source_tokens = meaningful(source_text)
+    matched_tokens = meaningful(matched_text)
+
+    def covered(tokens: list[str], others: list[str]) -> bool:
+        return all(
+            (
+                token in _NUMBER_WORDS
+                and any(other in _NUMBER_WORDS for other in others)
+            )
+            or any(
+                fuzz.ratio(token, other) / 100.0 >= TOKEN_SIMILARITY
+                for other in others
+            )
+            for token in tokens
+        )
+
+    if not source_tokens or not matched_tokens:
+        return True
+
+    return covered(matched_tokens, source_tokens)
+
+
+def _is_generic_building_match(
+    source_text: str,
+    matched_text: str,
+    matched_field: str,
+) -> bool:
+    """
+    Prevent the generic header 'Building' from being treated as a
+    deterministic fuzzy match for 'Number of Buildings'.
+
+    This guardrail is intentionally narrow.
+
+    We do NOT block general subset matches because valid domain aliases
+    such as:
+
+        Building Count -> Number of Buildings
+        Fire Sprinkler Protection -> Fire Sprinklers (Y/N)
+
+    must remain valid fuzzy matches.
+
+    The problematic case is specifically:
+
+        Building -> buildings -> Number of Buildings
+    """
+
+    source = source_text.strip().lower()
+    matched = matched_text.strip().lower()
+    target = normalize_header(matched_field)
+
+    if source != "building":
+        return False
+
+    if matched not in {"building", "buildings"}:
+        return False
+
+    if target != "number of buildings":
+        return False
+
+    return True
 
 
 def fuzzy_match_header(
@@ -67,6 +165,9 @@ def fuzzy_match_header(
 
     A match is accepted only when its normalized confidence is
     greater than or equal to the configured threshold.
+
+    A narrow semantic guardrail prevents generic 'Building' from
+    being deterministically assigned to 'Number of Buildings'.
     """
 
     assigned_fields = assigned_fields or set()
@@ -114,6 +215,46 @@ def fuzzy_match_header(
         )
 
     matched_field = choices[matched_text]
+
+    # Character similarity alone is fooled by headers that share most
+    # letters but differ in the key word ("account name" vs "county
+    # name"). Every meaningful word must also have a counterpart.
+    if not _tokens_compatible(normalized_header, matched_text):
+        return result.model_copy(
+            update={
+                "matched_text": matched_text,
+                "similarity_score": float(score),
+                "confidence": confidence,
+            }
+        )
+
+    # ------------------------------------------------------------
+    # Narrow generic-header guardrail
+    # ------------------------------------------------------------
+    #
+    # Building
+    #     ↓
+    # buildings
+    #     ↓
+    # Number of Buildings
+    #
+    # This is a lexical match, but "Building" does not establish
+    # that the source column represents a building count.
+    #
+    # Let the semantic/LLM layers resolve it instead.
+    #
+    if _is_generic_building_match(
+        normalized_header,
+        matched_text,
+        matched_field,
+    ):
+        return result.model_copy(
+            update={
+                "matched_text": matched_text,
+                "similarity_score": float(score),
+                "confidence": confidence,
+            }
+        )
 
     return result.model_copy(
         update={
