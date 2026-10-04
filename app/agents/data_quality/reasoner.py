@@ -222,20 +222,25 @@ class GroqReasoner:
     ) -> None:
         self.model = model or os.getenv("AGENT3_LLM_MODEL", self.DEFAULT_MODEL)
 
+        self._pool = None
+
         if client is not None:
             self.client = client
             return
 
-        from dotenv import load_dotenv
-        from groq import Groq
+        if api_key:
+            from groq import Groq
 
-        load_dotenv()
-        key = api_key or os.getenv("GROQ_API_KEY")
+            self.client = Groq(api_key=api_key)
+            return
 
-        if not key:
+        from app.llm_pool import configured_keys, get_pool
+
+        if not configured_keys():
             raise ValueError("GROQ_API_KEY is not configured.")
 
-        self.client = Groq(api_key=key)
+        self._pool = get_pool()
+        self.client = None
 
     def reconsider(
         self,
@@ -313,69 +318,40 @@ class GroqReasoner:
         }
 
     def _complete(self, system_prompt: str, payload: dict) -> Optional[str]:
-        from app.agents.schema_mapping.groq_client import (
-            _is_rate_limit,
-            _retry_delay,
-        )
+        """
+        One JSON completion through the key pool (or the explicit
+        client). Any failure returns None: callers fall back to
+        deterministic behaviour.
+        """
 
-        from app.agents.schema_mapping.groq_client import (
-            _rejects_reasoning_effort,
-            stop_if_quota_exhausted,
-            with_reasoning_effort,
-        )
-        from app.llm_rate_limiter import (
-            RATE_LIMITER,
-            LLMUnavailableError,
-            estimate_tokens,
-        )
+        from app.agents.schema_mapping.groq_client import with_reasoning_effort
+        from app.llm_pool import complete_with
+        from app.llm_rate_limiter import RATE_LIMITER
 
-        user = json.dumps(payload, default=str)
         request = with_reasoning_effort(
             self.model,
             {
                 "model": self.model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": user},
+                    {"role": "user", "content": json.dumps(payload, default=str)},
                 ],
                 "temperature": 0,
                 "response_format": {"type": "json_object"},
             },
         )
 
-        for attempt in range(1, 5):
-            try:
-                reservation = RATE_LIMITER.acquire(
-                    estimate_tokens(system_prompt, user, completion=2000)
-                )
-            except LLMUnavailableError:
-                return None
+        try:
+            pool = getattr(self, "_pool", None)
+            response = (
+                pool.complete(request, 2000)
+                if pool is not None
+                else complete_with(self.client, RATE_LIMITER, request, 2000)
+            )
+        except Exception:
+            return None
 
-            try:
-                response = self.client.chat.completions.create(**request)
-            except Exception as error:
-                if _rejects_reasoning_effort(error) and "reasoning_effort" in request:
-                    request = {k: v for k, v in request.items() if k != "reasoning_effort"}
-                    continue
-
-                if attempt == 4 or not _is_rate_limit(error):
-                    return None
-
-                try:
-                    stop_if_quota_exhausted(error, 20.0)
-                except LLMUnavailableError:
-                    return None
-
-                delay = _retry_delay(error, attempt, 20.0)
-                RATE_LIMITER.penalise(delay)
-                time.sleep(delay)
-                continue
-
-            usage = getattr(response, "usage", None)
-            RATE_LIMITER.record(reservation, getattr(usage, "total_tokens", None))
-            return response.choices[0].message.content or None
-
-        return None
+        return response.choices[0].message.content or None
 
 
 def masked_summary(recommendation: Recommendation) -> dict[str, Any]:

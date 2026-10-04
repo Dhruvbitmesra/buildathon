@@ -172,6 +172,16 @@ def sidebar() -> None:
                 f"{len(run.memory.entries) if run.memory else 'off'}"
             )
 
+            if run.use_llm:
+                from app.llm_pool import pool_status
+
+                status = pool_status()
+                exhausted = [label for label, reason in status if reason]
+                st.caption(
+                    f"Groq keys: {len(status)}"
+                    + (f" · {len(exhausted)} at quota ({', '.join(exhausted)})" if exhausted else " · all available")
+                )
+
             with st.expander("Timings", icon=":material/timer:"):
                 for stage, seconds in run.timings.items():
                     st.caption(f"{stage}: {seconds:.1f}s")

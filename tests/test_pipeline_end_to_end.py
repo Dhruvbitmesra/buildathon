@@ -765,3 +765,89 @@ def test_reasoning_effort_is_low_for_gpt_oss(monkeypatch):
 
     assert with_reasoning_effort("openai/gpt-oss-120b", {})["reasoning_effort"] == "low"
     assert "reasoning_effort" not in with_reasoning_effort("llama-3.3-70b", {})
+
+
+# ---------------------------------------------------------------------
+# Multiple API keys with failover
+# ---------------------------------------------------------------------
+
+
+class _Quota(Exception):
+    status_code = 429
+
+
+def _fake_groq(behaviour, calls, name):
+    class Completions:
+        def create(self, **request):
+            calls.append(name)
+            return behaviour(request)
+
+    return type("C", (), {"chat": type("Ch", (), {"completions": Completions()})()})()
+
+
+def test_keys_are_read_from_all_supported_variables(monkeypatch):
+    from app.llm_pool import configured_keys
+
+    for name in ["GROQ_API_KEYS", "GROQ_API_KEY"] + [f"GROQ_API_KEY_{i}" for i in range(1, 10)]:
+        monkeypatch.delenv(name, raising=False)
+
+    monkeypatch.setenv("GROQ_API_KEY", "k-main")
+    monkeypatch.setenv("GROQ_API_KEY_2", "k-two")
+    monkeypatch.setenv("GROQ_API_KEYS", "k-list-1, k-main ,k-list-2")
+
+    assert configured_keys() == ["k-list-1", "k-main", "k-list-2", "k-two"]
+
+
+def test_pool_fails_over_to_the_next_key_on_daily_quota():
+    from app.llm_pool import GroqKeyPool
+
+    calls = []
+
+    def exhausted(request):
+        raise _Quota(DAILY_LIMIT_MESSAGE)
+
+    def ok(request):
+        return "answer"
+
+    pool = GroqKeyPool(["key-a", "key-b"], tokens_per_minute=10**9)
+    pool.slots[0]._client = _fake_groq(exhausted, calls, "a")
+    pool.slots[1]._client = _fake_groq(ok, calls, "b")
+
+    assert pool.complete({"messages": []}) == "answer"
+    assert pool.complete({"messages": []}) == "answer"
+    assert calls == ["a", "b", "b"]  # key a is parked after its quota is hit
+    assert pool.status()[0][1] is not None and pool.status()[1][1] is None
+    assert "key-a" not in str(pool.status())  # never exposes key values
+
+
+def test_pool_reports_when_every_key_is_exhausted():
+    from app.llm_pool import GroqKeyPool
+    from app.llm_rate_limiter import LLMUnavailableError
+
+    calls = []
+
+    def exhausted(request):
+        raise _Quota(DAILY_LIMIT_MESSAGE)
+
+    pool = GroqKeyPool(["key-a", "key-b"], tokens_per_minute=10**9)
+    pool.slots[0]._client = _fake_groq(exhausted, calls, "a")
+    pool.slots[1]._client = _fake_groq(exhausted, calls, "b")
+
+    with pytest.raises(LLMUnavailableError) as error:
+        pool.complete({"messages": []})
+
+    assert "Every configured Groq key" in str(error.value)
+    assert calls == ["a", "b"]
+
+
+def test_clients_use_the_shared_pool(monkeypatch):
+    from app.agents.data_quality.reasoner import GroqReasoner
+    from app.agents.schema_mapping.groq_client import GroqLLMClient
+    from app.llm_pool import get_pool
+
+    monkeypatch.setenv("GROQ_API_KEY", "k-main")
+    monkeypatch.setenv("GROQ_API_KEY_2", "k-two")
+
+    assert GroqLLMClient()._pool is get_pool()
+    assert GroqReasoner()._pool is get_pool()
+    assert len(get_pool().slots) >= 2

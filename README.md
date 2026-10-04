@@ -23,6 +23,7 @@ All agents share one typed state object (`app/state/sov_state.py`).
 ```bash
 uv sync                      # Python 3.13
 cp .env.example .env         # optional: GROQ_API_KEY=... enables LLM reasoning
+                             # more keys (GROQ_API_KEY_2, ...) = automatic failover
 ```
 
 The first run downloads two small Hugging Face models (embeddings and a

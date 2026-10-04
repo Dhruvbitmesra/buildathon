@@ -75,10 +75,9 @@ def readable_read_error(error: Exception) -> str:
 
 
 def llm_available() -> bool:
-    from dotenv import load_dotenv
+    from app.llm_pool import configured_keys
 
-    load_dotenv()
-    return bool(os.getenv("GROQ_API_KEY"))
+    return bool(configured_keys())
 
 
 def prefer_offline_models() -> None:

@@ -27,7 +27,7 @@ from app.llm_rate_limiter import (
 load_dotenv()
 
 
-DEFAULT_MODEL = "openai/gpt-oss-120b"
+DEFAULT_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 class GroqLLMClient:
@@ -40,15 +40,23 @@ class GroqLLMClient:
     ):
         self.model = model
 
-        key = api_key or os.getenv("GROQ_API_KEY")
+        if api_key:
+            # One explicit key: no failover.
+            self._pool = None
+            self.client = Groq(api_key=api_key)
+            return
 
-        if not key:
+        from app.llm_pool import configured_keys, get_pool
+
+        if not configured_keys():
             raise ValueError(
                 "GROQ_API_KEY is not configured. "
                 "Add it to the .env file."
             )
 
-        self.client = Groq(api_key=key)
+        # All configured keys, with automatic failover between them.
+        self._pool = get_pool()
+        self.client = None
 
     def decide(
         self,
@@ -165,85 +173,50 @@ class GroqLLMClient:
 
     def _create_with_retry(self, _completion_tokens: int = 400, **request):
         """
-        Call the chat API inside the shared token budget, and wait and
-        retry if the API still answers 429 (rate limited).
+        Run a chat completion inside the token budget: through the key
+        pool (failover between keys) or, when this client was given one
+        explicit key/client, on that client alone.
         """
 
-        prompt_text = "".join(
-            message.get("content", "") for message in request.get("messages", [])
-        )
+        from app.llm_pool import complete_with
+
         request = with_reasoning_effort(self.model, request)
-        attempt = 0
+        pool = getattr(self, "_pool", None)
 
-        while True:
-            reservation = RATE_LIMITER.acquire(
-                estimate_tokens(prompt_text, completion=_completion_tokens)
-            )
+        if pool is not None:
+            return pool.complete(request, _completion_tokens)
 
-            try:
-                response = self.client.chat.completions.create(**request)
-            except Exception as error:
-                if _rejects_reasoning_effort(error) and "reasoning_effort" in request:
-                    request = {k: v for k, v in request.items() if k != "reasoning_effort"}
-                    continue
-
-                if not _is_rate_limit(error):
-                    raise
-
-                stop_if_quota_exhausted(error, self.MAX_WAIT_SECONDS)
-                attempt += 1
-
-                if attempt > self.MAX_RETRIES:
-                    raise
-
-                delay = _retry_delay(error, attempt, self.MAX_WAIT_SECONDS)
-                RATE_LIMITER.penalise(delay)
-                time.sleep(delay)
-                continue
-
-            usage = getattr(response, "usage", None)
-            RATE_LIMITER.record(reservation, getattr(usage, "total_tokens", None))
-            return response
+        return complete_with(self.client, RATE_LIMITER, request, _completion_tokens)
 
 
 def _is_rate_limit(error: Exception) -> bool:
-    status = getattr(error, "status_code", None)
-    return status == 429 or "rate limit" in str(error).lower()
+    from app.llm_pool import is_rate_limit
+
+    return is_rate_limit(error)
 
 
 def _retry_delay(error: Exception, attempt: int, cap: float) -> float:
-    """Use the server's "try again in ..." hint, else exponential backoff."""
+    from app.llm_pool import retry_delay
 
-    hint = parse_retry_after(str(error))
-
-    if hint is not None:
-        return min(hint + 0.5, cap)
-
-    return min(2.0 ** attempt, cap)
+    return retry_delay(error, attempt, cap)
 
 
 def stop_if_quota_exhausted(error: Exception, max_wait: float) -> None:
-    """
-    A daily quota, or any limit that resets later than `max_wait`,
-    cannot be waited out inside one run: stop calling the LLM until it
-    resets and let the agents continue deterministically.
-    """
+    """Block the shared single-key budget when its quota is used up."""
 
-    message = str(error)
-    hint = parse_retry_after(message)
-    daily = "per day" in message.lower() or "(tpd)" in message.lower() or "(rpd)" in message.lower()
+    from app.llm_pool import quota_exhausted
 
-    if not daily and (hint is None or hint <= max_wait):
+    reset = quota_exhausted(error, max_wait)
+
+    if reset is None:
         return
 
-    seconds = hint if hint is not None else 3600.0
-    kind = "daily token quota" if daily else "rate limit"
-    minutes, secs = divmod(int(seconds), 60)
+    minutes, seconds = divmod(int(reset), 60)
     reason = (
-        f"The LLM provider's {kind} is used up (resets in about "
-        f"{minutes}m {secs}s); continuing without the LLM."
+        "The LLM provider's daily token quota is used up (resets in about "
+        f"{minutes}m {seconds}s); continuing without the LLM."
     )
-    RATE_LIMITER.block(seconds, reason)
+    RATE_LIMITER.block(reset, reason)
     raise LLMUnavailableError(reason) from error
 
 
@@ -263,5 +236,6 @@ def with_reasoning_effort(model: str, request: dict) -> dict:
 
 
 def _rejects_reasoning_effort(error: Exception) -> bool:
-    text = str(error).lower()
-    return "reasoning_effort" in text and ("400" in text or "unsupported" in text or "invalid" in text)
+    from app.llm_pool import rejects_reasoning_effort
+
+    return rejects_reasoning_effort(error)
